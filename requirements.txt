@@ -1,4 +1,3 @@
 python-telegram-bot==21.6
-flask
 openpyxl
 ortools
