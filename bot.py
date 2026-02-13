@@ -569,6 +569,15 @@ def build_telegram_app() -> Application:
 # ============================================================
 flask_app = Flask(__name__)
 
+@flask_app.before_request
+def _ensure_bot_started():
+    # Ensure PTB is started inside the Gunicorn worker process
+    try:
+        start_background_bot()
+    except Exception:
+        log.exception("Failed to start PTB background thread")
+
+
 ptb_app: Optional[Application] = None
 BOT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 _started = False
@@ -608,7 +617,20 @@ def _handle_update():
         log.warning("⚠️ No JSON parsed (content-type=%s)", request.content_type)
         return "OK", 200
 
-    # ✅ readiness barrière
+    # ✅ readiness barrière (Gunicorn: ensure started in worker)
+if (not READY.is_set()) or ptb_app is None or BOT_LOOP is None:
+    # try starting in this process
+    try:
+        start_background_bot()
+    except Exception:
+        log.exception("Failed to start PTB from webhook")
+
+    # wait briefly for readiness
+    for _ in range(25):
+        if READY.is_set() and (ptb_app is not None) and (BOT_LOOP is not None):
+            break
+        time.sleep(0.08)
+
     if (not READY.is_set()) or ptb_app is None or BOT_LOOP is None:
         log.warning("⚠️ Update reçu mais PTB pas prêt (READY=%s ptb_app=%s loop=%s)",
                     READY.is_set(), bool(ptb_app), bool(BOT_LOOP))
@@ -664,8 +686,7 @@ def start_background_bot():
     _started = True
     threading.Thread(target=_bot_thread, daemon=True).start()
 
-# ✅ démarre automatiquement quand gunicorn import bot.py
-start_background_bot()
 
 if __name__ == "__main__":
+    start_background_bot()
     print("Local: python bot.py (Render uses gunicorn bot:flask_app)")
