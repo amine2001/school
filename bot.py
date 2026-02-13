@@ -308,13 +308,16 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
     transit_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
 
-    add_count_balance_dimension(routing, manager, num_orders=len(orders))
-    force_min_one_stop_per_vehicle_if_possible(routing, manager, num_orders=len(orders), num_vehicles=num_vehicles)
+    # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité
+    # (permet au solveur de toujours trouver une solution et de répartir)
+    penalty = 10**7
+    for node in range(1, len(points)):
+        routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(8)
+    params.time_limit.FromSeconds(10)
 
     solution = routing.SolveWithParameters(params)
     if not solution:
@@ -331,6 +334,7 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
             idx = solution.Value(routing.NextVar(idx))
         routes.append(stops)
     return routes
+
 
 def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float, float]]) -> str:
     if not stops_latlon:
