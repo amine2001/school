@@ -1,13 +1,13 @@
-Store,Lat,Lon
-Hyper Borj Fes,34.0462000,-4.9947700
-Gourmet Zaers,33.9744760,-6.8292260	
-Hyper Dar Bouazza,33.5170680,-7.7995570
-Hyper Sidi Maarouf,33.5360660,-7.6420230
-Hyper Temara,33.9084730,-6.9394150
-Hyper Salé,34.0588980,-6.8020320
-Hyper Targa,31.6508700,-8.0591240
-Hyper Al Mazar,31.5926080,-7.9871110
-Hyper Tanger,35.7814640,-5.8409930
-Hyper Tetouan,35.5783690,-5.3339140
-Hyper Agadir,30.3892750,-9.5101280
-Hyper Beni Mellal,32.3208500,-6.3851800
+store_id,store_name,lat,lon
+HBF,Hyper Borj Fes,34.0462,-4.99477
+GZ,Hyper Zaers,33.974476,-6.829226
+HDB,Hyper Dar Bouazza,33.517068,-7.799557
+HSM,Hyper Sidi Maarouf,33.536066,-7.642023
+HTM,Hyper Temara,33.908473,-6.939415
+HS,Hyper Sale,34.058898,-6.802032
+HTG,Hyper Targa,31.650870,-8.059124
+HAM,Hyper Al Mazar,31.592608,-7.987111
+HTR,Hyper Tanger,35.781464,-5.840993
+HTT,Hyper Tetouan,35.578369,-5.333914
+HAG,Hyper Agadir,30.389275,-9.510128
+HBM,Hyper Beni Mellal,32.320850,-6.385180
