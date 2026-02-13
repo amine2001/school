@@ -9,8 +9,7 @@ import openpyxl
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 from flask import Flask, request
-from dotenv import load_dotenv
-load_dotenv()
+
 
 from telegram import (
     Update,
