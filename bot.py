@@ -9,6 +9,7 @@ import asyncio
 import atexit
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
+from datetime import date
 
 import requests
 from flask import Flask, request
@@ -32,12 +33,13 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # required
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")        # required ex: https://bringo-bot.onrender.com/webhook
 
-# Redash CSV endpoint (NO api_key here, unless you prefer URL includes it)
+# Redash CSV endpoint (can include ?api_key=... already)
 REDASH_RESULTS_CSV_URL = os.getenv(
     "REDASH_RESULTS_CSV_URL",
     "https://redash-ro-live.bringo.ro/api/queries/4441/results.csv"
 )
-# Redash API key ONLY (not an URL)
+
+# OPTIONAL: if you prefer key separated (do NOT put an URL here, only the key)
 REDASH_API_KEY = os.getenv("REDASH_API_KEY", "").strip()
 
 STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
@@ -52,6 +54,11 @@ SLOTS_FIXED = [
     "18:00 - 20:00",
     "20:00 - 22:00",
 ]
+
+# ✅ Business rules (as requested)
+REQUIRED_STATUS = "new"               # ONLY NEW
+REQUIRED_DELIVERY_TYPE = "planned order"  # Delivery Type must be Planned Order (case-insensitive)
+ONLY_TODAY = True                     # Day Of Delivery must be today
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bringo-bot")
@@ -147,13 +154,29 @@ def _fmt_hhmm(v) -> Optional[str]:
 def norm_slot(s: str) -> str:
     return (s or "").lower().replace(" ", "").replace("–", "-").replace("--", "-")
 
+def norm_text(s: str) -> str:
+    return (s or "").strip().lower()
+
+def today_str_variants() -> set:
+    """Match both dd/mm/yy and dd/mm/yyyy."""
+    d = date.today()
+    return {d.strftime("%d/%m/%y"), d.strftime("%d/%m/%Y")}
+
+def date_is_today(value: str) -> bool:
+    if not value:
+        return False
+    s = str(value).strip()
+    return s in today_str_variants()
+
 def parse_redash_rows(csv_text: str) -> List[Dict]:
     """
     Expected columns (from your CSV):
     - Order Number
     - Store
-    - Status (we keep only received)
-    - Debut De Creneau, Fin De Creneau  -> build slot 'HH:MM - HH:MM'
+    - Status (we keep only NEW)
+    - Delivery Type (must be Planned Order)
+    - Day Of Delivery (must be today)
+    - Debut De Creneau, Fin De Creneau -> build slot 'HH:MM - HH:MM'
     - LatLong (or Latitude/Longitude)
     """
     f = io.StringIO(csv_text)
@@ -163,7 +186,10 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
     for row in reader:
         order_id = (row.get("Order Number") or row.get("Order") or "").strip()
         store = (row.get("Store") or "").strip()
-        status = (row.get("Status") or "").strip().lower()
+
+        status = norm_text(row.get("Status"))
+        delivery_type = norm_text(row.get("Delivery Type"))
+        day_of_delivery = (row.get("Day Of Delivery") or "").strip()
 
         start = _fmt_hhmm(row.get("Debut De Creneau"))
         end = _fmt_hhmm(row.get("Fin De Creneau"))
@@ -182,14 +208,25 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
         if not order_id or not store or not slot or not ll:
             continue
 
-        # ✅ keep only received
-        if status != "received":
+        # ✅ ONLY NEW
+        if status != REQUIRED_STATUS:
+            continue
+
+        # ✅ ONLY Planned Order
+        if delivery_type != REQUIRED_DELIVERY_TYPE:
+            continue
+
+        # ✅ ONLY today
+        if ONLY_TODAY and (not date_is_today(day_of_delivery)):
             continue
 
         rows.append({
             "order_id": order_id,
             "store": store,
             "slot": slot,
+            "status": status,
+            "delivery_type": delivery_type,
+            "day_of_delivery": day_of_delivery,
             "lat": ll[0],
             "lon": ll[1],
             "raw": row,
@@ -206,6 +243,7 @@ def filter_orders(rows: List[Dict], store_name: str, slot: str) -> List[Tuple[st
             continue
         if norm_slot(r["slot"]) != norm_slot(slot):
             continue
+        # (status/delivery_type/date already filtered in parse_redash_rows)
         out.append((r["order_id"], r["lat"], r["lon"]))
     return out
 
@@ -507,7 +545,7 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
         msg = (
             f"⚠️ Aucune commande valide trouvée.\n"
             f"Magasin: {store_name}\nCréneau: {slot}\n"
-            f"(Contrôle: Store + Lat/Lon + Status=received + Créneau)"
+            f"(Règles: Status=new + Delivery Type=Planned Order + Day Of Delivery=today + Lat/Lon + Créneau)"
         )
         if edit_from_query:
             await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
@@ -520,7 +558,7 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     lines = [
         f"📍 Magasin: {store_name}",
         f"🕒 Créneau: {slot}",
-        f"📦 Commandes (received): {len(orders)}",
+        f"📦 Commandes (new/planned/today): {len(orders)}",
         f"🚴 Livreurs: {num_drivers}",
         "",
     ]
@@ -606,6 +644,7 @@ def _ensure_bot_started():
             start_background_bot(wait_ready=False)
         except Exception:
             log.exception("Failed to start PTB background thread")
+
 @flask_app.get("/")
 def health():
     return "OK", 200
