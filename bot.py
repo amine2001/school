@@ -26,17 +26,19 @@ from telegram.ext import (
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-# ----------------------------
+# ============================
 # CONFIG (Render Env Vars)
-# ----------------------------
+# ============================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # required
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")        # required ex: https://bringo-bot.onrender.com/webhook
 
+# Redash CSV endpoint (NO api_key here, unless you prefer URL includes it)
 REDASH_RESULTS_CSV_URL = os.getenv(
     "REDASH_RESULTS_CSV_URL",
     "https://redash-ro-live.bringo.ro/api/queries/4441/results.csv"
 )
-REDASH_API_KEY = os.getenv("REDASH_API_KEY")  # required if Redash asks login
+# Redash API key ONLY (not an URL)
+REDASH_API_KEY = os.getenv("REDASH_API_KEY", "").strip()
 
 STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
 MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
@@ -54,9 +56,9 @@ SLOTS_FIXED = [
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bringo-bot")
 
-# ----------------------------
+# ============================
 # Telegram Conversation States
-# ----------------------------
+# ============================
 (CHOOSE_STORE, CHOOSE_SLOT, CHOOSE_DRIVERS) = range(3)
 
 # context keys
@@ -67,9 +69,9 @@ CTX_STORE_DEPOT = "store_depot"
 CTX_SLOT = "slot"
 CTX_NUM_DRIVERS = "num_drivers"
 
-# ----------------------------
+# ============================
 # Helpers: Stores CSV
-# ----------------------------
+# ============================
 def load_stores_from_csv(path: str) -> List[Dict]:
     stores = []
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
@@ -92,15 +94,17 @@ def load_stores_from_csv(path: str) -> List[Dict]:
     stores.sort(key=lambda x: x["store_name"].lower())
     return stores
 
-# ----------------------------
-# Helpers: Redash CSV fetch + parse
-# ----------------------------
+# ============================
+# Helpers: Redash fetch
+# ============================
 def _with_api_key(url: str) -> str:
-    """Append api_key query param to Redash URL."""
+    """Append api_key param only if REDASH_API_KEY exists and api_key not already present."""
     if not REDASH_API_KEY:
         return url
     u = urlparse(url)
     q = dict(parse_qsl(u.query))
+    if "api_key" in q and q["api_key"]:
+        return url
     q["api_key"] = REDASH_API_KEY
     return urlunparse(u._replace(query=urlencode(q)))
 
@@ -110,6 +114,9 @@ def fetch_redash_csv_text() -> str:
     r.raise_for_status()
     return r.text
 
+# ============================
+# Helpers: parse CSV rows
+# ============================
 def parse_latlong(latlong: str) -> Optional[Tuple[float, float]]:
     if not latlong:
         return None
@@ -118,37 +125,65 @@ def parse_latlong(latlong: str) -> Optional[Tuple[float, float]]:
         return None
     a, b = s.split(",", 1)
     try:
-        lat = float(a.strip())
-        lon = float(b.strip())
+        lat = float(a.strip().replace(",", "."))
+        lon = float(b.strip().replace(",", "."))
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             return None
         return lat, lon
     except Exception:
         return None
 
-def norm_text(s: str) -> str:
-    return (s or "").strip().lower()
+def _fmt_hhmm(v) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() == "nan":
+        return None
+    # examples: "20:00:00" -> "20:00"
+    if ":" in s and len(s) >= 5:
+        return s[:5]
+    return None
 
 def norm_slot(s: str) -> str:
-    return (s or "").lower().replace(" ", "").replace("h", ":").replace("–", "-").replace("--", "-")
+    return (s or "").lower().replace(" ", "").replace("–", "-").replace("--", "-")
 
 def parse_redash_rows(csv_text: str) -> List[Dict]:
+    """
+    Expected columns (from your CSV):
+    - Order Number
+    - Store
+    - Status (we keep only received)
+    - Debut De Creneau, Fin De Creneau  -> build slot 'HH:MM - HH:MM'
+    - LatLong (or Latitude/Longitude)
+    """
     f = io.StringIO(csv_text)
     reader = csv.DictReader(f)
+
     rows = []
     for row in reader:
         order_id = (row.get("Order Number") or row.get("Order") or "").strip()
         store = (row.get("Store") or "").strip()
-        slot = (row.get("Creneau") or row.get("Créneau") or row.get("Slot") or "").strip()
-        latlong = row.get("LatLong") or row.get("Lat Long") or row.get("latlong")
+        status = (row.get("Status") or "").strip().lower()
 
-        ll = parse_latlong(latlong)
-        if not order_id or not store or not ll:
+        start = _fmt_hhmm(row.get("Debut De Creneau"))
+        end = _fmt_hhmm(row.get("Fin De Creneau"))
+        slot = f"{start} - {end}" if start and end else ""
+
+        # lat/lon
+        ll = parse_latlong(row.get("LatLong"))
+        if not ll:
+            try:
+                lat = float(str(row.get("Latitude")).strip().replace(",", "."))
+                lon = float(str(row.get("Longitude")).strip().replace(",", "."))
+                ll = (lat, lon)
+            except Exception:
+                ll = None
+
+        if not order_id or not store or not slot or not ll:
             continue
 
-        # si colonne Status existe -> on garde received
-        st = row.get("Status")
-        if st is not None and norm_text(st) not in ("received", "reçu", "recu"):
+        # ✅ keep only received
+        if status != "received":
             continue
 
         rows.append({
@@ -169,17 +204,14 @@ def filter_orders(rows: List[Dict], store_name: str, slot: str) -> List[Tuple[st
     for r in rows:
         if (r["store"] or "").strip() != (store_name or "").strip():
             continue
-
-        # ✅ match créneau de manière robuste
         if norm_slot(r["slot"]) != norm_slot(slot):
             continue
-
         out.append((r["order_id"], r["lat"], r["lon"]))
     return out
 
-# ----------------------------
+# ============================
 # VRP utilities
-# ----------------------------
+# ============================
 def haversine_m(lat1, lon1, lat2, lon2) -> float:
     R = 6371000.0
     p1 = math.radians(lat1)
@@ -275,9 +307,9 @@ def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float,
         url += f"&waypoints={waypoints}"
     return url
 
-# ----------------------------
+# ============================
 # Telegram UI helpers
-# ----------------------------
+# ============================
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("🆕 Nouveau trajet", callback_data="NEW")],
@@ -303,9 +335,9 @@ async def ensure_stores(context: ContextTypes.DEFAULT_TYPE) -> List[Dict]:
     context.user_data[CTX_STORES] = stores
     return stores
 
-# ----------------------------
+# ============================
 # Handlers
-# ----------------------------
+# ============================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("✅ /start received from chat_id=%s", update.effective_chat.id if update.effective_chat else None)
     await ensure_stores(context)
@@ -475,7 +507,7 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
         msg = (
             f"⚠️ Aucune commande valide trouvée.\n"
             f"Magasin: {store_name}\nCréneau: {slot}\n"
-            f"(Contrôle: Store + LatLong + Order Number + (Status=received si dispo))"
+            f"(Contrôle: Store + Lat/Lon + Status=received + Créneau)"
         )
         if edit_from_query:
             await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
@@ -488,7 +520,7 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     lines = [
         f"📍 Magasin: {store_name}",
         f"🕒 Créneau: {slot}",
-        f"📦 Commandes: {len(orders)}",
+        f"📦 Commandes (received): {len(orders)}",
         f"🚴 Livreurs: {num_drivers}",
         "",
     ]
@@ -519,9 +551,9 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
 
     return ConversationHandler.END
 
-# ----------------------------
+# ============================
 # Build Telegram Application
-# ----------------------------
+# ============================
 def build_telegram_app() -> Application:
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
