@@ -307,6 +307,23 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
 
     transit_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+    # ✅ Balance des commandes (N/K)
+    def count_cb(from_index, to_index):
+        node = manager.IndexToNode(to_index)
+        return 0 if node == 0 else 1
+
+    count_idx = routing.RegisterTransitCallback(count_cb)
+
+    routing.AddDimension(
+        count_idx,
+        0,
+        len(orders),
+        True,
+        "Count"
+    )
+
+    count_dim = routing.GetDimensionOrDie("Count")
+    count_dim.SetGlobalSpanCostCoefficient(1000)
 
     # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité
     # (permet au solveur de toujours trouver une solution et de répartir)
