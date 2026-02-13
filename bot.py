@@ -4,7 +4,7 @@ import re
 import math
 import tempfile
 from typing import List, Dict, Tuple, Optional
-
+import asyncio
 import openpyxl
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
@@ -378,7 +378,11 @@ def main():
     app.add_handler(CallbackQueryHandler(on_shop_choice, pattern=r"^SHOP:"))
     app.add_handler(CallbackQueryHandler(on_vehicle_choice, pattern=r"^VEH:"))
     app.add_handler(MessageHandler(filters.Document.ALL, on_excel))
-
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     # ✅ Webhook server intégré (pas Flask) => évite "Event loop is closed"
     app.run_webhook(
         listen="0.0.0.0",
