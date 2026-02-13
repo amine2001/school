@@ -8,6 +8,7 @@ import threading
 import asyncio
 import atexit
 from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
 import requests
 from flask import Flask, request
@@ -35,10 +36,20 @@ REDASH_RESULTS_CSV_URL = os.getenv(
     "REDASH_RESULTS_CSV_URL",
     "https://redash-ro-live.bringo.ro/api/queries/4441/results.csv"
 )
-REDASH_API_KEY = os.getenv("REDASH_API_KEY")  # optional
+REDASH_API_KEY = os.getenv("REDASH_API_KEY")  # required if Redash asks login
 
 STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
 MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
+
+# ✅ Créneaux FIXES (pas de "Tous les créneaux")
+SLOTS_FIXED = [
+    "10:00 - 12:00",
+    "12:00 - 14:00",
+    "14:00 - 16:00",
+    "16:00 - 18:00",
+    "18:00 - 20:00",
+    "20:00 - 22:00",
+]
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bringo-bot")
@@ -46,11 +57,7 @@ log = logging.getLogger("bringo-bot")
 # ----------------------------
 # Telegram Conversation States
 # ----------------------------
-(
-    CHOOSE_STORE,
-    CHOOSE_SLOT,
-    CHOOSE_DRIVERS,
-) = range(3)
+(CHOOSE_STORE, CHOOSE_SLOT, CHOOSE_DRIVERS) = range(3)
 
 # context keys
 CTX_STORES = "stores"
@@ -88,11 +95,18 @@ def load_stores_from_csv(path: str) -> List[Dict]:
 # ----------------------------
 # Helpers: Redash CSV fetch + parse
 # ----------------------------
+def _with_api_key(url: str) -> str:
+    """Append api_key query param to Redash URL."""
+    if not REDASH_API_KEY:
+        return url
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query))
+    q["api_key"] = REDASH_API_KEY
+    return urlunparse(u._replace(query=urlencode(q)))
+
 def fetch_redash_csv_text() -> str:
-    headers = {}
-    if REDASH_API_KEY:
-        headers["Authorization"] = f"Key {REDASH_API_KEY}"
-    r = requests.get(REDASH_RESULTS_CSV_URL, headers=headers, timeout=60)
+    url = _with_api_key(REDASH_RESULTS_CSV_URL)
+    r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.text
 
@@ -115,20 +129,24 @@ def parse_latlong(latlong: str) -> Optional[Tuple[float, float]]:
 def norm_text(s: str) -> str:
     return (s or "").strip().lower()
 
+def norm_slot(s: str) -> str:
+    return (s or "").lower().replace(" ", "").replace("h", ":").replace("–", "-").replace("--", "-")
+
 def parse_redash_rows(csv_text: str) -> List[Dict]:
     f = io.StringIO(csv_text)
     reader = csv.DictReader(f)
     rows = []
     for row in reader:
-        order_id = (row.get("Order Number") or "").strip()
+        order_id = (row.get("Order Number") or row.get("Order") or "").strip()
         store = (row.get("Store") or "").strip()
-        slot = (row.get("Creneau") or "").strip()
-        latlong = row.get("LatLong")
+        slot = (row.get("Creneau") or row.get("Créneau") or row.get("Slot") or "").strip()
+        latlong = row.get("LatLong") or row.get("Lat Long") or row.get("latlong")
 
         ll = parse_latlong(latlong)
         if not order_id or not store or not ll:
             continue
 
+        # si colonne Status existe -> on garde received
         st = row.get("Status")
         if st is not None and norm_text(st) not in ("received", "reçu", "recu"):
             continue
@@ -146,23 +164,16 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
         rows = rows[:MAX_ORDERS]
     return rows
 
-def get_slots_for_store(rows: List[Dict], store_name: str) -> List[str]:
-    return sorted({
-        (r["slot"] or "").strip()
-        for r in rows
-        if (r["store"] or "").strip() == (store_name or "").strip()
-        and (r["slot"] or "").strip()
-    })
-
-def filter_orders(rows: List[Dict], store_name: str, slot: Optional[str]) -> List[Tuple[str, float, float]]:
+def filter_orders(rows: List[Dict], store_name: str, slot: str) -> List[Tuple[str, float, float]]:
     out = []
     for r in rows:
         if (r["store"] or "").strip() != (store_name or "").strip():
             continue
-        if slot and slot != "__ALL__" and (r["slot"] or "").strip() != (slot or "").strip():
+
+        # ✅ match créneau de manière robuste
+        if norm_slot(r["slot"]) != norm_slot(slot):
             continue
-        if r.get("lat") is None or r.get("lon") is None:
-            continue
+
         out.append((r["order_id"], r["lat"], r["lon"]))
     return out
 
@@ -299,10 +310,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("✅ /start received from chat_id=%s", update.effective_chat.id if update.effective_chat else None)
     await ensure_stores(context)
     if update.message:
-        await update.message.reply_text(
-            "Bot Last Mile Bringo ✅\nChoisis une action :",
-            reply_markup=main_menu_kb()
-        )
+        await update.message.reply_text("Bot Last Mile Bringo ✅\nChoisis une action :", reply_markup=main_menu_kb())
 
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -313,16 +321,11 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await ensure_redash_cache(context, force=True)
             await q.edit_message_text("✅ Actualisation effectuée.", reply_markup=main_menu_kb())
         except Exception as e:
-            await q.edit_message_text(f"❌ Erreur actualisation Redash: {e}", reply_markup=main_menu_kb())
+            await q.edit_message_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
         return ConversationHandler.END
 
     if q.data == "NEW":
         await ensure_stores(context)
-        try:
-            await ensure_redash_cache(context, force=False)
-        except Exception:
-            pass
-
         stores = context.user_data[CTX_STORES]
         buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
         kb = chunk_buttons(buttons, per_row=2)
@@ -353,17 +356,8 @@ async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[CTX_STORE_NAME] = store["store_name"]
     context.user_data[CTX_STORE_DEPOT] = (store["lat"], store["lon"])
 
-    try:
-        rows = await ensure_redash_cache(context, force=False)
-        slots = get_slots_for_store(rows, store["store_name"])
-    except Exception as e:
-        slots = []
-        log.exception("Slots error: %s", e)
-
-    btns = [InlineKeyboardButton("📦 Tous les créneaux", callback_data="SLOT::__ALL__")]
-    for s in slots[:40]:
-        btns.append(InlineKeyboardButton(s, callback_data=f"SLOT::{s}"))
-
+    # ✅ Créneaux FIXES uniquement
+    btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
     kb = chunk_buttons(btns, per_row=2)
     kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
 
@@ -397,10 +391,8 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb.append([InlineKeyboardButton("⬅️ Retour créneaux", callback_data="BACK_SLOTS")])
 
     store_name = context.user_data.get(CTX_STORE_NAME, "")
-    slot_label = "Tous" if slot == "__ALL__" else slot
-
     await q.edit_message_text(
-        f"✅ Magasin: {store_name}\n✅ Créneau: {slot_label}\n\n🚴 Choisis le nombre de livreurs :",
+        f"✅ Magasin: {store_name}\n✅ Créneau: {slot}\n\n🚴 Choisis le nombre de livreurs :",
         reply_markup=InlineKeyboardMarkup(kb)
     )
     return CHOOSE_DRIVERS
@@ -416,12 +408,7 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
                 return ConversationHandler.END
 
-            rows = await ensure_redash_cache(context, force=False)
-            slots = get_slots_for_store(rows, store_name)
-
-            btns = [InlineKeyboardButton("📦 Tous les créneaux", callback_data="SLOT::__ALL__")]
-            for s in slots[:40]:
-                btns.append(InlineKeyboardButton(s, callback_data=f"SLOT::{s}"))
+            btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
             kb = chunk_buttons(btns, per_row=2)
             kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
 
@@ -465,8 +452,8 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     slot = context.user_data.get(CTX_SLOT)
     num_drivers = int(context.user_data.get(CTX_NUM_DRIVERS, 1))
 
-    if not store_name or not depot:
-        msg = "❌ Magasin manquant. Clique sur 🆕 Nouveau trajet."
+    if not store_name or not depot or not slot:
+        msg = "❌ Données manquantes. Clique sur 🆕 Nouveau trajet."
         if edit_from_query:
             await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
         else:
@@ -485,10 +472,9 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
 
     orders = filter_orders(rows, store_name, slot)
     if not orders:
-        slot_label = "Tous" if slot == "__ALL__" else slot
         msg = (
             f"⚠️ Aucune commande valide trouvée.\n"
-            f"Magasin: {store_name}\nCréneau: {slot_label}\n"
+            f"Magasin: {store_name}\nCréneau: {slot}\n"
             f"(Contrôle: Store + LatLong + Order Number + (Status=received si dispo))"
         )
         if edit_from_query:
@@ -499,19 +485,18 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
 
     routes_nodes = solve_vrp(depot, orders, num_drivers)
 
-    lines = []
-    slot_label = "Tous" if slot == "__ALL__" else slot
-    lines.append(f"📍 Magasin: {store_name}")
-    lines.append(f"🕒 Créneau: {slot_label}")
-    lines.append(f"📦 Commandes: {len(orders)}")
-    lines.append(f"🚴 Livreurs: {num_drivers}")
-    lines.append("")
+    lines = [
+        f"📍 Magasin: {store_name}",
+        f"🕒 Créneau: {slot}",
+        f"📦 Commandes: {len(orders)}",
+        f"🚴 Livreurs: {num_drivers}",
+        "",
+    ]
 
     for v in range(num_drivers):
         stops_nodes = routes_nodes[v]
         if not stops_nodes:
-            lines.append(f"👤 Livreur {v+1}: 0 commande")
-            lines.append("—")
+            lines += [f"👤 Livreur {v+1}: 0 commande", "—"]
             continue
 
         stop_orders = [orders[node-1] for node in stops_nodes]
@@ -528,13 +513,9 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     text = "\n".join(lines)
 
     if edit_from_query:
-        await update.callback_query.edit_message_text(
-            text, reply_markup=main_menu_kb(), disable_web_page_preview=True
-        )
+        await update.callback_query.edit_message_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
     else:
-        await update.message.reply_text(
-            text, reply_markup=main_menu_kb(), disable_web_page_preview=True
-        )
+        await update.message.reply_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
 
     return ConversationHandler.END
 
@@ -582,7 +563,6 @@ STARTED = False
 
 @flask_app.before_request
 def _ensure_bot_started():
-    # Ensure PTB is started inside the Gunicorn worker process
     if not READY.is_set():
         try:
             start_background_bot()
@@ -619,7 +599,6 @@ def _handle_update():
         log.warning("⚠️ No JSON parsed (content-type=%s)", request.content_type)
         return "OK", 200
 
-    # ✅ readiness barrière (Gunicorn: ensure started in worker)
     if (not READY.is_set()) or ptb_app is None or BOT_LOOP is None:
         try:
             start_background_bot()
@@ -717,6 +696,5 @@ def _on_exit():
 atexit.register(_on_exit)
 
 if __name__ == "__main__":
-    # local run convenience
     start_background_bot()
     print("Local: gunicorn bot:flask_app --bind 0.0.0.0:10000 --workers 1 --threads 8")
