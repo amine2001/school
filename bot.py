@@ -595,12 +595,17 @@ STARTED = False
 
 @flask_app.before_request
 def _ensure_bot_started():
+    # ✅ IMPORTANT: Render port-scan hits "/" with GET/HEAD.
+    # Do NOT block health checks by waiting for Telegram startup.
+    if request.path == "/" and request.method in ("GET", "HEAD"):
+        return None
+
     if not READY.is_set():
         try:
-            start_background_bot()
+            # Start in background, non-blocking
+            start_background_bot(wait_ready=False)
         except Exception:
             log.exception("Failed to start PTB background thread")
-
 @flask_app.get("/")
 def health():
     return "OK", 200
@@ -633,7 +638,7 @@ def _handle_update():
 
     if (not READY.is_set()) or ptb_app is None or BOT_LOOP is None:
         try:
-            start_background_bot()
+            start_background_bot(wait_ready=False)
         except Exception:
             log.exception("Failed to start PTB from webhook")
 
@@ -702,7 +707,7 @@ def _bot_thread():
         except Exception:
             pass
 
-def start_background_bot():
+def start_background_bot(wait_ready: bool = False):
     global STARTED
     with START_LOCK:
         if STARTED:
@@ -717,10 +722,11 @@ def start_background_bot():
         t = threading.Thread(target=_bot_thread, daemon=True)
         t.start()
 
-        for _ in range(60):
-            if READY.is_set():
-                break
-            time.sleep(0.1)
+        if wait_ready:
+            for _ in range(60):
+                if READY.is_set():
+                    break
+                time.sleep(0.1)
 
 def _on_exit():
     log.info("Shutdown requested (atexit).")
@@ -728,5 +734,5 @@ def _on_exit():
 atexit.register(_on_exit)
 
 if __name__ == "__main__":
-    start_background_bot()
+    start_background_bot(wait_ready=True)
     print("Local: gunicorn bot:flask_app --bind 0.0.0.0:10000 --workers 1 --threads 8")
