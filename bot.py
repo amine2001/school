@@ -24,7 +24,16 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import BadRequest
 
+async def safe_answer(q):
+    if not q:
+        return
+    try:
+        await q.answer(cache_time=0)
+    except BadRequest:
+        # callback trop vieux -> on ignore pour éviter crash
+        pass
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 # ============================
@@ -333,6 +342,12 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
     for v in range(num_vehicles):
         end = routing.End(v)
         count_dim.CumulVar(end).SetRange(min_load, max_load)
+    if n >= k:
+        min_load = n // k
+        max_load = math.ceil(n / k)
+        for v in range(num_vehicles):
+            end = routing.End(v)
+            count_dim.CumulVar(end).SetRange(min_load, max_load)
 
     # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité
     # (permet au solveur de toujours trouver une solution et de répartir)
@@ -414,7 +429,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
 
     if q.data == "REFRESH":
         try:
@@ -437,7 +452,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
 
     if q.data == "BACK_MENU":
         await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
@@ -469,7 +484,7 @@ async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
 
     if q.data == "BACK_STORES":
         stores = await ensure_stores(context)
@@ -500,7 +515,8 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q:
-        await q.answer()
+        await safe_answer(q)
+
 
         if q.data == "BACK_SLOTS":
             store_name = context.user_data.get(CTX_STORE_NAME)
