@@ -27,13 +27,13 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 # CONFIG (Render Env Vars)
 # ----------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # required
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")        # required (https://.../webhook)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")        # required ex: https://bringo-bot.onrender.com/webhook
 
 REDASH_RESULTS_CSV_URL = os.getenv(
     "REDASH_RESULTS_CSV_URL",
     "https://redash-ro-live.bringo.ro/api/queries/4441/results.csv"
 )
-REDASH_API_KEY = os.getenv("REDASH_API_KEY")  # optional if URL already includes key OR open endpoint
+REDASH_API_KEY = os.getenv("REDASH_API_KEY")  # optional
 
 STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
 MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
@@ -85,7 +85,7 @@ def load_stores_from_csv(path: str) -> List[Dict]:
 
 # ----------------------------
 # Helpers: Redash CSV fetch + parse
-# Columns:
+# Columns expected:
 # - Order Number
 # - Store
 # - Creneau
@@ -95,7 +95,6 @@ def fetch_redash_csv_text() -> str:
     headers = {}
     if REDASH_API_KEY:
         headers["Authorization"] = f"Key {REDASH_API_KEY}"
-
     r = requests.get(REDASH_RESULTS_CSV_URL, headers=headers, timeout=60)
     r.raise_for_status()
     return r.text
@@ -139,18 +138,17 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
             "raw": row,
         })
 
-    # safety cap
     if len(rows) > MAX_ORDERS:
         rows = rows[:MAX_ORDERS]
     return rows
 
 def get_slots_for_store(rows: List[Dict], store_name: str) -> List[str]:
-    slots = sorted({
+    return sorted({
         (r["slot"] or "").strip()
         for r in rows
-        if (r["store"] or "").strip() == (store_name or "").strip() and (r["slot"] or "").strip()
+        if (r["store"] or "").strip() == (store_name or "").strip()
+        and (r["slot"] or "").strip()
     })
-    return slots
 
 def filter_orders(rows: List[Dict], store_name: str, slot: Optional[str]) -> List[Tuple[str, float, float]]:
     out = []
@@ -194,13 +192,7 @@ def add_count_balance_dimension(routing, manager, num_orders):
         return 0 if node == 0 else 1
 
     count_idx = routing.RegisterTransitCallback(count_cb)
-    routing.AddDimension(
-        count_idx,
-        0,
-        num_orders,
-        True,
-        "Count"
-    )
+    routing.AddDimension(count_idx, 0, num_orders, True, "Count")
     count_dim = routing.GetDimensionOrDie("Count")
     count_dim.SetGlobalSpanCostCoefficient(100)
 
@@ -279,10 +271,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 def chunk_buttons(buttons: List[InlineKeyboardButton], per_row: int = 2) -> List[List[InlineKeyboardButton]]:
-    rows = []
-    for i in range(0, len(buttons), per_row):
-        rows.append(buttons[i:i+per_row])
-    return rows
+    return [buttons[i:i+per_row] for i in range(0, len(buttons), per_row)]
 
 async def ensure_redash_cache(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> List[Dict]:
     if (not force) and context.user_data.get(CTX_REDASH_CACHE):
@@ -491,7 +480,11 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     orders = filter_orders(rows, store_name, slot)
     if not orders:
         slot_label = "Tous" if slot == "__ALL__" else slot
-        msg = f"⚠️ Aucune commande valide trouvée.\nMagasin: {store_name}\nCréneau: {slot_label}\n(Contrôle: Store + LatLong + Order Number)"
+        msg = (
+            f"⚠️ Aucune commande valide trouvée.\n"
+            f"Magasin: {store_name}\nCréneau: {slot_label}\n"
+            f"(Contrôle: Store + LatLong + Order Number)"
+        )
         if edit_from_query:
             await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
         else:
@@ -518,7 +511,6 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
         stop_orders = [orders[node-1] for node in stops_nodes]
         ids = [o[0] for o in stop_orders]
         latlons = [(o[1], o[2]) for o in stop_orders]
-
         gmap = google_maps_link(depot, latlons)
 
         lines.append(f"👤 Livreur {v+1}: {len(ids)} commandes")
@@ -530,14 +522,18 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     text = "\n".join(lines)
 
     if edit_from_query:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+        await update.callback_query.edit_message_text(
+            text, reply_markup=main_menu_kb(), disable_web_page_preview=True
+        )
     else:
-        await update.message.reply_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+        await update.message.reply_text(
+            text, reply_markup=main_menu_kb(), disable_web_page_preview=True
+        )
 
     return ConversationHandler.END
 
 # ----------------------------
-# Build Telegram Application (Conversation)
+# Build Telegram Application
 # ----------------------------
 def build_telegram_app() -> Application:
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -548,8 +544,12 @@ def build_telegram_app() -> Application:
             CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH)$"),
         ],
         states={
-            CHOOSE_STORE: [CallbackQueryHandler(choose_store, pattern="^(STORE::|BACK_MENU|BACK_STORES).*$")],
-            CHOOSE_SLOT: [CallbackQueryHandler(choose_slot, pattern="^(SLOT::|BACK_STORES).*$")],
+            CHOOSE_STORE: [
+                CallbackQueryHandler(choose_store, pattern="^(STORE::|BACK_MENU|BACK_STORES).*$")
+            ],
+            CHOOSE_SLOT: [
+                CallbackQueryHandler(choose_slot, pattern="^(SLOT::|BACK_STORES).*$")
+            ],
             CHOOSE_DRIVERS: [
                 CallbackQueryHandler(choose_drivers, pattern="^(DRV::|BACK_SLOTS).*$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, drivers_text),
@@ -562,11 +562,14 @@ def build_telegram_app() -> Application:
     application.add_handler(conv)
     return application
 
-# ----------------------------
-# Flask Webhook bridge (ONE Flask app)
-# ----------------------------
+# ============================================================
+# ✅ PATCH ULTIME : traiter l’update directement (process_update)
+# ============================================================
 flask_app = Flask(__name__)
+
 ptb_app: Optional[Application] = None
+BOT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_started = False
 
 @flask_app.get("/")
 def health():
@@ -574,70 +577,60 @@ def health():
 
 @flask_app.post("/webhook")
 def webhook():
-    return _handle_telegram_update()
+    return _handle_update()
 
 @flask_app.post("/")
 def webhook_root():
-    # ✅ tes logs montrent des POST / 405 → on traite aussi /
-    return _handle_telegram_update()
+    # fallback si Telegram POST sur "/"
+    return _handle_update()
 
-def _handle_telegram_update():
-    global ptb_app
+def _handle_update():
+    global ptb_app, BOT_LOOP
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return "No JSON", 400
 
-    if ptb_app is None:
-        # IMPORTANT: ne pas renvoyer 503 sinon Telegram réessaie en boucle
+    # IMPORTANT: même si le bot n’est pas prêt, répondre 200 pour éviter retry infini
+    if not data or ptb_app is None or BOT_LOOP is None:
         return "OK", 200
 
     try:
         update = Update.de_json(data, ptb_app.bot)
-        ptb_app.update_queue.put_nowait(update)
+        asyncio.run_coroutine_threadsafe(ptb_app.process_update(update), BOT_LOOP)
     except Exception as e:
-        print("Webhook error:", e)
+        log.exception("Webhook error: %s", e)
 
     return "OK", 200
 
-# ----------------------------
-# Start PTB under gunicorn (AUTO on import)
-# ----------------------------
-_started = False
+def _bot_thread():
+    global ptb_app, BOT_LOOP
 
-def _run_ptb_forever():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_TOKEN env var")
+    if not WEBHOOK_URL:
+        raise RuntimeError("Missing WEBHOOK_URL env var (ex: https://xxx.onrender.com/webhook)")
+
+    BOT_LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(BOT_LOOP)
+
     async def runner():
         global ptb_app
-        if not TELEGRAM_TOKEN:
-            raise RuntimeError("Missing TELEGRAM_TOKEN env var")
-        if not WEBHOOK_URL:
-            raise RuntimeError("Missing WEBHOOK_URL env var (ex: https://xxx.onrender.com/webhook)")
-
         ptb_app = build_telegram_app()
-
         await ptb_app.initialize()
         await ptb_app.start()
-
-        # ✅ force webhook à chaque boot + drop pending
         await ptb_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+        log.info("✅ PTB started + webhook set: %s", WEBHOOK_URL)
 
-        log.info("PTB started + webhook set to %s", WEBHOOK_URL)
-
-        # keep alive forever
-        await asyncio.Event().wait()
-
-    asyncio.run(runner())
+    BOT_LOOP.run_until_complete(runner())
+    BOT_LOOP.run_forever()
 
 def start_background_bot():
     global _started
     if _started:
         return
     _started = True
-    t = threading.Thread(target=_run_ptb_forever, daemon=True)
-    t.start()
+    threading.Thread(target=_bot_thread, daemon=True).start()
 
-# ✅ this is the key: runs when gunicorn imports bot.py
+# ✅ démarre automatiquement quand gunicorn import bot.py
 start_background_bot()
 
-# Local debug (optional): python bot.py
 if __name__ == "__main__":
-    print("Running local debug. Flask via: flask --app bot run  (or use gunicorn)")
+    print("Local: python bot.py (Render uses gunicorn bot:flask_app)")
