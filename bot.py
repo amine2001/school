@@ -6,6 +6,7 @@ import time
 import logging
 import threading
 import asyncio
+import atexit
 from typing import Dict, List, Tuple, Optional
 
 import requests
@@ -86,11 +87,6 @@ def load_stores_from_csv(path: str) -> List[Dict]:
 
 # ----------------------------
 # Helpers: Redash CSV fetch + parse
-# Columns expected:
-# - Order Number
-# - Store
-# - Creneau
-# - LatLong (e.g "31.63219,-8.004811")
 # ----------------------------
 def fetch_redash_csv_text() -> str:
     headers = {}
@@ -116,6 +112,9 @@ def parse_latlong(latlong: str) -> Optional[Tuple[float, float]]:
     except Exception:
         return None
 
+def norm_text(s: str) -> str:
+    return (s or "").strip().lower()
+
 def parse_redash_rows(csv_text: str) -> List[Dict]:
     f = io.StringIO(csv_text)
     reader = csv.DictReader(f)
@@ -128,6 +127,10 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
 
         ll = parse_latlong(latlong)
         if not order_id or not store or not ll:
+            continue
+
+        st = row.get("Status")
+        if st is not None and norm_text(st) not in ("received", "reçu", "recu"):
             continue
 
         rows.append({
@@ -292,13 +295,14 @@ async def ensure_stores(context: ContextTypes.DEFAULT_TYPE) -> List[Dict]:
 # ----------------------------
 # Handlers
 # ----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.info("✅ /start received chat_id=%s", update.effective_chat.id if update.effective_chat else None)
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("✅ /start received from chat_id=%s", update.effective_chat.id if update.effective_chat else None)
     await ensure_stores(context)
-    await update.message.reply_text(
-        "Bot Last Mile Bringo ✅\nChoisis une action :",
-        reply_markup=main_menu_kb()
-    )
+    if update.message:
+        await update.message.reply_text(
+            "Bot Last Mile Bringo ✅\nChoisis une action :",
+            reply_markup=main_menu_kb()
+        )
 
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -354,7 +358,7 @@ async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
         slots = get_slots_for_store(rows, store["store_name"])
     except Exception as e:
         slots = []
-        log.exception(e)
+        log.exception("Slots error: %s", e)
 
     btns = [InlineKeyboardButton("📦 Tous les créneaux", callback_data="SLOT::__ALL__")]
     for s in slots[:40]:
@@ -485,7 +489,7 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
         msg = (
             f"⚠️ Aucune commande valide trouvée.\n"
             f"Magasin: {store_name}\nCréneau: {slot_label}\n"
-            f"(Contrôle: Store + LatLong + Order Number)"
+            f"(Contrôle: Store + LatLong + Order Number + (Status=received si dispo))"
         )
         if edit_from_query:
             await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
@@ -542,7 +546,7 @@ def build_telegram_app() -> Application:
 
     conv = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start),
+            CommandHandler("start", start_cmd),
             CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH)$"),
         ],
         states={
@@ -557,7 +561,7 @@ def build_telegram_app() -> Application:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, drivers_text),
             ],
         },
-        fallbacks=[CommandHandler("start", start)],
+        fallbacks=[CommandHandler("start", start_cmd)],
         allow_reentry=True,
     )
 
@@ -565,23 +569,25 @@ def build_telegram_app() -> Application:
     return application
 
 # ============================================================
-# ✅ PATCH ULTIME : traiter l’update directement (process_update)
+# ✅ Render Webhook Bridge: Flask -> PTB.process_update
 # ============================================================
 flask_app = Flask(__name__)
+
+ptb_app: Optional[Application] = None
+BOT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+READY = threading.Event()
+START_LOCK = threading.Lock()
+STARTED = False
 
 @flask_app.before_request
 def _ensure_bot_started():
     # Ensure PTB is started inside the Gunicorn worker process
-    try:
-        start_background_bot()
-    except Exception:
-        log.exception("Failed to start PTB background thread")
-
-
-ptb_app: Optional[Application] = None
-BOT_LOOP: Optional[asyncio.AbstractEventLoop] = None
-_started = False
-READY = threading.Event()
+    if not READY.is_set():
+        try:
+            start_background_bot()
+        except Exception:
+            log.exception("Failed to start PTB background thread")
 
 @flask_app.get("/")
 def health():
@@ -593,23 +599,19 @@ def webhook():
 
 @flask_app.post("/")
 def webhook_root():
-    # fallback si Telegram POST sur "/"
     return _handle_update()
 
 def _handle_update():
     global ptb_app, BOT_LOOP
 
-    # 🔥 log brut (debug)
     raw = request.data.decode("utf-8", errors="ignore")
     log.info("INCOMING RAW (first 500): %s", raw[:500])
 
     data = request.get_json(force=False, silent=True)
-
-    # fallback si Flask ne parse pas le JSON
     if not data:
         try:
-            import json as _json
-            data = _json.loads(raw) if raw else None
+            import json
+            data = json.loads(raw) if raw else None
         except Exception:
             data = None
 
@@ -618,23 +620,21 @@ def _handle_update():
         return "OK", 200
 
     # ✅ readiness barrière (Gunicorn: ensure started in worker)
-if (not READY.is_set()) or ptb_app is None or BOT_LOOP is None:
-    # try starting in this process
-    try:
-        start_background_bot()
-    except Exception:
-        log.exception("Failed to start PTB from webhook")
-
-    # wait briefly for readiness
-    for _ in range(25):
-        if READY.is_set() and (ptb_app is not None) and (BOT_LOOP is not None):
-            break
-        time.sleep(0.08)
-
     if (not READY.is_set()) or ptb_app is None or BOT_LOOP is None:
-        log.warning("⚠️ Update reçu mais PTB pas prêt (READY=%s ptb_app=%s loop=%s)",
-                    READY.is_set(), bool(ptb_app), bool(BOT_LOOP))
-        return "OK", 200
+        try:
+            start_background_bot()
+        except Exception:
+            log.exception("Failed to start PTB from webhook")
+
+        for _ in range(25):
+            if READY.is_set() and (ptb_app is not None) and (BOT_LOOP is not None):
+                break
+            time.sleep(0.08)
+
+        if (not READY.is_set()) or ptb_app is None or BOT_LOOP is None:
+            log.warning("⚠️ Update reçu mais PTB pas prêt (READY=%s ptb_app=%s loop=%s)",
+                        READY.is_set(), bool(ptb_app), bool(BOT_LOOP))
+            return "OK", 200
 
     try:
         update = Update.de_json(data, ptb_app.bot)
@@ -659,34 +659,64 @@ if (not READY.is_set()) or ptb_app is None or BOT_LOOP is None:
 def _bot_thread():
     global ptb_app, BOT_LOOP
 
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_TOKEN env var")
-    if not WEBHOOK_URL:
-        raise RuntimeError("Missing WEBHOOK_URL env var (ex: https://xxx.onrender.com/webhook)")
-
     BOT_LOOP = asyncio.new_event_loop()
     asyncio.set_event_loop(BOT_LOOP)
 
     async def runner():
         global ptb_app
         ptb_app = build_telegram_app()
+
         await ptb_app.initialize()
         await ptb_app.start()
-        await ptb_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+
+        await ptb_app.bot.set_webhook(
+            url=WEBHOOK_URL,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+
         READY.set()
         log.info("✅ PTB READY + webhook set: %s", WEBHOOK_URL)
 
-    BOT_LOOP.run_until_complete(runner())
-    BOT_LOOP.run_forever()
+    try:
+        BOT_LOOP.run_until_complete(runner())
+        BOT_LOOP.run_forever()
+    except Exception:
+        log.exception("❌ PTB thread crashed")
+    finally:
+        try:
+            if ptb_app is not None:
+                BOT_LOOP.run_until_complete(ptb_app.stop())
+                BOT_LOOP.run_until_complete(ptb_app.shutdown())
+        except Exception:
+            pass
 
 def start_background_bot():
-    global _started
-    if _started:
-        return
-    _started = True
-    threading.Thread(target=_bot_thread, daemon=True).start()
+    global STARTED
+    with START_LOCK:
+        if STARTED:
+            return
+        STARTED = True
 
+        if not TELEGRAM_TOKEN:
+            raise RuntimeError("Missing TELEGRAM_TOKEN env var")
+        if not WEBHOOK_URL:
+            raise RuntimeError("Missing WEBHOOK_URL env var (ex: https://xxx.onrender.com/webhook)")
+
+        t = threading.Thread(target=_bot_thread, daemon=True)
+        t.start()
+
+        for _ in range(60):
+            if READY.is_set():
+                break
+            time.sleep(0.1)
+
+def _on_exit():
+    log.info("Shutdown requested (atexit).")
+
+atexit.register(_on_exit)
 
 if __name__ == "__main__":
+    # local run convenience
     start_background_bot()
-    print("Local: python bot.py (Render uses gunicorn bot:flask_app)")
+    print("Local: gunicorn bot:flask_app --bind 0.0.0.0:10000 --workers 1 --threads 8")
