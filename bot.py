@@ -324,6 +324,15 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
 
     count_dim = routing.GetDimensionOrDie("Count")
     count_dim.SetGlobalSpanCostCoefficient(1000)
+    # 🔥 HARD BALANCING N/K (chaque livreur doit avoir ~ N/K commandes)
+    n = len(orders)
+    k = num_vehicles
+    min_load = n // k
+    max_load = math.ceil(n / k)
+
+    for v in range(num_vehicles):
+        end = routing.End(v)
+        count_dim.CumulVar(end).SetRange(min_load, max_load)
 
     # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité
     # (permet au solveur de toujours trouver une solution et de répartir)
