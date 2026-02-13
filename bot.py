@@ -1,397 +1,685 @@
 import os
+import io
 import csv
-import re
 import math
-import tempfile
-from typing import List, Dict, Tuple, Optional
-import asyncio
-import openpyxl
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+import logging
+from typing import Dict, List, Tuple, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import requests
+from flask import Flask, request
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    ConversationHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-# =========================
-# CONFIG (Render)
-# =========================
-TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-PORT = int(os.environ.get("PORT", "10000"))
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-# Ton fichier magasins (dans ton repo)
-SHOPS_CSV = "shops.csv"  # si tu as stores_coords.csv -> mets "stores_coords.csv"
+# ----------------------------
+# CONFIG (Render Env Vars)
+# ----------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # required
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")        # required (https://.../webhook)
+
+# Redash: use env vars (DO NOT hardcode api key)
+REDASH_RESULTS_CSV_URL = os.getenv(
+    "REDASH_RESULTS_CSV_URL",
+    "https://redash-ro-live.bringo.ro/api/queries/4441/results.csv"
+)
+REDASH_API_KEY = os.getenv("REDASH_API_KEY")  # optional if URL already includes key OR open endpoint
+
+STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
+
+# Optional: limit max orders for performance
+MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bringo-bot")
+
+# ----------------------------
+# Telegram Conversation States
+# ----------------------------
+(
+    CHOOSE_STORE,
+    CHOOSE_SLOT,
+    CHOOSE_DRIVERS,
+) = range(3)
+
+# context keys
+CTX_STORES = "stores"
+CTX_REDASH_CACHE = "redash_cache"  # parsed rows cache
+CTX_STORE_NAME = "store_name"
+CTX_STORE_DEPOT = "store_depot"    # (lat, lon)
+CTX_SLOT = "slot"
+CTX_NUM_DRIVERS = "num_drivers"
 
 
-# =========================
-# SHOPS CSV LOADER (ROBUST)
-# - Accepte 2 formats:
-#   A) store_id,store_name,lat,lon
-#   B) Store,Lat,Lon   (ton format actuel)
-# - Accepte séparateur ; ou ,
-# - Ignore lignes vides/mal formées
-# =========================
-def load_shops(csv_path: str) -> List[Dict]:
-    shops = []
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        sample = f.read(4096)
-        f.seek(0)
-        delimiter = ";" if sample.count(";") > sample.count(",") else ","
-
-        reader = csv.DictReader(f, delimiter=delimiter)
-        idx = 0
-
-        for row in reader:
-            if not row:
+# ----------------------------
+# Helpers: Stores CSV
+# ----------------------------
+def load_stores_from_csv(path: str) -> List[Dict]:
+    stores = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            name = (r.get("store_name") or "").strip()
+            lat = r.get("lat")
+            lon = r.get("lon")
+            if not name or lat is None or lon is None:
                 continue
-            idx += 1
-
-            # Format A
-            sid = (row.get("store_id") or "").strip()
-            name = (row.get("store_name") or "").strip()
-            lat_raw = (row.get("lat") or "").strip()
-            lon_raw = (row.get("lon") or "").strip()
-
-            # Format B (ton fichier)
-            if not name:
-                name = (row.get("Store") or row.get("store") or "").strip()
-            if not lat_raw:
-                lat_raw = (row.get("Lat") or row.get("LAT") or "").strip()
-            if not lon_raw:
-                lon_raw = (row.get("Lon") or row.get("LON") or "").strip()
-
-            # Si pas store_id, on en fabrique un stable
-            if not sid:
-                sid = f"S{idx:02d}"
-
-            if not (name and lat_raw and lon_raw):
-                continue
-
-            lat_raw = lat_raw.replace(",", ".")
-            lon_raw = lon_raw.replace(",", ".")
-
             try:
-                lat = float(lat_raw)
-                lon = float(lon_raw)
-            except ValueError:
+                stores.append({
+                    "store_id": (r.get("store_id") or name).strip(),
+                    "store_name": name,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                })
+            except Exception:
                 continue
-
-            shops.append({"id": sid, "name": name, "lat": lat, "lon": lon})
-
-    if not shops:
-        raise RuntimeError(f"{csv_path} invalide. Vérifie colonnes + lat/lon.")
-    return shops
+    # sort alphabetically
+    stores.sort(key=lambda x: x["store_name"].lower())
+    return stores
 
 
-SHOPS = load_shops(SHOPS_CSV)
+# ----------------------------
+# Helpers: Redash CSV fetch + parse
+# Columns you showed:
+# - Order Number
+# - Store
+# - Creneau
+# - LatLong  (format "31.63219,-8.004811")
+# ----------------------------
+def fetch_redash_csv_text() -> str:
+    headers = {}
+    # Many Redash setups accept either ?api_key=... or Authorization header.
+    if REDASH_API_KEY:
+        headers["Authorization"] = f"Key {REDASH_API_KEY}"
+
+    r = requests.get(REDASH_RESULTS_CSV_URL, headers=headers, timeout=60)
+    r.raise_for_status()
+    return r.text
 
 
-def get_shop(shop_id: str) -> Optional[Dict]:
-    return next((s for s in SHOPS if s["id"] == shop_id), None)
+def parse_latlong(latlong: str) -> Optional[Tuple[float, float]]:
+    if not latlong:
+        return None
+    s = str(latlong).strip().replace(";", ",")
+    if "," not in s:
+        return None
+    a, b = s.split(",", 1)
+    try:
+        lat = float(a.strip())
+        lon = float(b.strip())
+        # basic validity
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        return lat, lon
+    except Exception:
+        return None
 
 
-# =========================
-# UI KEYBOARDS
-# =========================
-def shops_keyboard() -> InlineKeyboardMarkup:
-    # 1 bouton par ligne
-    rows = [[InlineKeyboardButton(s["name"], callback_data=f"SHOP:{s['id']}")] for s in SHOPS]
-    return InlineKeyboardMarkup(rows)
+def parse_redash_rows(csv_text: str) -> List[Dict]:
+    f = io.StringIO(csv_text)
+    reader = csv.DictReader(f)
+    rows = []
+    for row in reader:
+        # normalize keys with exact column names
+        order_id = (row.get("Order Number") or "").strip()
+        store = (row.get("Store") or "").strip()
+        slot = (row.get("Creneau") or "").strip()
+        latlong = row.get("LatLong")
 
-
-def vehicles_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("1", callback_data="VEH:1"),
-             InlineKeyboardButton("2", callback_data="VEH:2"),
-             InlineKeyboardButton("3", callback_data="VEH:3")],
-            [InlineKeyboardButton("4", callback_data="VEH:4"),
-             InlineKeyboardButton("5", callback_data="VEH:5"),
-             InlineKeyboardButton("6", callback_data="VEH:6")],
-        ]
-    )
-
-
-# =========================
-# EXCEL READER (ROBUST HEADER)
-# - Cherche un header: order_id + lat + lon (variants acceptés)
-# =========================
-def _norm(s: str) -> str:
-    return (s or "").strip().lower().replace(" ", "").replace("_", "")
-
-
-def read_orders_from_xlsx(path: str) -> List[Tuple[str, float, float]]:
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb.active
-
-    id_keys = {"orderid", "order", "commande", "id"}
-    lat_keys = {"lat", "latitude"}
-    lon_keys = {"lon", "lng", "long", "longitude"}
-
-    header_row = None
-    col_id = col_lat = col_lon = None
-
-    for r in range(1, min(ws.max_row, 60) + 1):
-        row = []
-        for c in range(1, min(ws.max_column, 30) + 1):
-            row.append(_norm(str(ws.cell(row=r, column=c).value)) if ws.cell(row=r, column=c).value is not None else "")
-
-        tmp_id = tmp_lat = tmp_lon = None
-        for i, h in enumerate(row, start=1):
-            if h in id_keys and tmp_id is None:
-                tmp_id = i
-            if h in lat_keys and tmp_lat is None:
-                tmp_lat = i
-            if h in lon_keys and tmp_lon is None:
-                tmp_lon = i
-
-        if tmp_id and tmp_lat and tmp_lon:
-            header_row = r
-            col_id, col_lat, col_lon = tmp_id, tmp_lat, tmp_lon
-            break
-
-    if not header_row:
-        raise ValueError("Excel doit contenir les colonnes: order_id, lat, lon (ou variantes).")
-
-    orders: List[Tuple[str, float, float]] = []
-    for r in range(header_row + 1, ws.max_row + 1):
-        oid = ws.cell(row=r, column=col_id).value
-        lat = ws.cell(row=r, column=col_lat).value
-        lon = ws.cell(row=r, column=col_lon).value
-
-        if oid is None and lat is None and lon is None:
+        ll = parse_latlong(latlong)
+        if not order_id or not store or not ll:
             continue
 
-        oid_str = str(oid).strip() if oid is not None else ""
-        if not oid_str:
+        rows.append({
+            "order_id": order_id,
+            "store": store,
+            "slot": slot,
+            "lat": ll[0],
+            "lon": ll[1],
+            "raw": row,
+        })
+
+    return rows
+
+
+def get_slots_for_store(rows: List[Dict], store_name: str) -> List[str]:
+    slots = sorted({(r["slot"] or "").strip() for r in rows if r["store"] == store_name and (r["slot"] or "").strip()})
+    # If empty, still allow "Tous"
+    return slots
+
+
+def filter_orders(rows: List[Dict], store_name: str, slot: Optional[str]) -> List[Tuple[str, float, float]]:
+    """
+    Filtre les commandes Redash selon :
+    - le magasin choisi
+    - le créneau choisi
+    - LatLong valide
+    """
+
+    out = []
+
+    for r in rows:
+
+        # 🔴 MATCH EXACT avec Redash colonne "Store"
+        if r["store"].strip() != store_name.strip():
             continue
 
-        try:
-            lat_f = float(lat)
-            lon_f = float(lon)
-        except Exception:
+        # 🔴 FILTRE CRENEAU
+        if slot and slot != "__ALL__" and (r["slot"] or "").strip() != slot.strip():
             continue
 
-        orders.append((oid_str, lat_f, lon_f))
+        # 🔴 VERIF LAT LONG
+        if r.get("lat") is None or r.get("lon") is None:
+            continue
 
-    if not orders:
-        raise ValueError("Aucune commande détectée dans l’Excel.")
-    return orders
+        out.append((r["order_id"], r["lat"], r["lon"]))
 
+    return out
 
-# =========================
-# VRP HELPERS (Haversine + OR-Tools)
-# =========================
-def haversine_km(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    R = 6371.0
-    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
-    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
-    dlat, dlon = lat2 - lat1, lon2 - lon1
-    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(h))
+# ----------------------------
+# VRP utilities
+# ----------------------------
+def haversine_m(lat1, lon1, lat2, lon2) -> float:
+    R = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
 
 
 def build_distance_matrix(points: List[Tuple[float, float]]) -> List[List[int]]:
+    # OR-Tools expects integers; use meters
     n = len(points)
     mat = [[0] * n for _ in range(n)]
     for i in range(n):
+        lat1, lon1 = points[i]
         for j in range(n):
             if i == j:
-                mat[i][j] = 0
-            else:
-                mat[i][j] = int(haversine_km(points[i], points[j]) * 1000)  # meters
+                continue
+            lat2, lon2 = points[j]
+            mat[i][j] = int(haversine_m(lat1, lon1, lat2, lon2))
     return mat
 
 
-def solve_vrp_balanced(
-    start: Tuple[float, float],
+def add_count_balance_dimension(routing, manager, num_orders):
+    def count_cb(from_index, to_index):
+        node = manager.IndexToNode(to_index)
+        return 0 if node == 0 else 1
+
+    count_idx = routing.RegisterTransitCallback(count_cb)
+    routing.AddDimension(
+        count_idx,
+        0,
+        num_orders,
+        True,
+        "Count"
+    )
+    count_dim = routing.GetDimensionOrDie("Count")
+    # encourage balanced number of stops
+    count_dim.SetGlobalSpanCostCoefficient(100)
+
+
+def force_min_one_stop_per_vehicle_if_possible(routing, manager, num_orders, num_vehicles):
+    # If orders >= vehicles, ensure each vehicle serves >= 1 order
+    if num_orders < num_vehicles:
+        return
+    solver = routing.solver()
+    order_nodes = range(1, num_orders + 1)  # because node 0 is depot
+    for v in range(num_vehicles):
+        served_by_v = [
+            solver.IsEqualCstVar(routing.VehicleVar(manager.NodeToIndex(i)), v)
+            for i in order_nodes
+        ]
+        solver.Add(solver.Sum(served_by_v) >= 1)
+
+
+def solve_vrp(
+    depot: Tuple[float, float],
     orders: List[Tuple[str, float, float]],
-    num_vehicles: int,
-    time_limit_sec: int = 8,
+    num_vehicles: int
 ) -> List[List[int]]:
-    num_vehicles = min(num_vehicles, len(orders))
+    """
+    Returns routes as list of node indices (1..n) per vehicle.
+    Vehicle routes may be empty.
+    """
+    # nodes: 0=depot, 1..n=orders
+    points = [depot] + [(lat, lon) for (_, lat, lon) in orders]
+    dist = build_distance_matrix(points)
 
-    coords = [start] + [(o[1], o[2]) for o in orders]  # node0 depot
-    dist = build_distance_matrix(coords)
-
-    manager = pywrapcp.RoutingIndexManager(len(coords), num_vehicles, 0)
+    manager = pywrapcp.RoutingIndexManager(len(points), num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
 
-    def distance_cb(from_idx, to_idx):
-        f = manager.IndexToNode(from_idx)
-        t = manager.IndexToNode(to_idx)
-        return dist[f][t]
+    def dist_cb(from_index, to_index):
+        i = manager.IndexToNode(from_index)
+        j = manager.IndexToNode(to_index)
+        return dist[i][j]
 
-    transit = routing.RegisterTransitCallback(distance_cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit)
+    transit_idx = routing.RegisterTransitCallback(dist_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
 
-    # ✅ encourage using more vehicles (évite 6 commandes sur 1)
-    routing.SetFixedCostOfAllVehicles(10000)
-
-    # ✅ capacity = max commandes par livreur
-    demands = [0] + [1] * len(orders)
-
-    def demand_cb(from_idx):
-        node = manager.IndexToNode(from_idx)
-        return demands[node]
-
-    demand = routing.RegisterUnaryTransitCallback(demand_cb)
-    max_per = math.ceil(len(orders) / num_vehicles)
-
-    routing.AddDimensionWithVehicleCapacity(
-        demand,
-        0,
-        [max_per] * num_vehicles,
-        True,
-        "Capacity",
-    )
+    # Encourage compact routes & balancing
+    add_count_balance_dimension(routing, manager, num_orders=len(orders))
+    # Force min 1 stop per vehicle when possible
+    force_min_one_stop_per_vehicle_if_possible(routing, manager, num_orders=len(orders), num_vehicles=num_vehicles)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(time_limit_sec)
+    params.time_limit.FromSeconds(8)
 
-    sol = routing.SolveWithParameters(params)
-    if not sol:
-        raise ValueError("Aucune solution VRP trouvée (essaie moins de livreurs).")
+    solution = routing.SolveWithParameters(params)
+    if not solution:
+        return [[] for _ in range(num_vehicles)]
 
-    routes: List[List[int]] = []
+    routes = []
     for v in range(num_vehicles):
         idx = routing.Start(v)
-        route = []
+        stops = []
         while not routing.IsEnd(idx):
             node = manager.IndexToNode(idx)
             if node != 0:
-                route.append(node - 1)  # order index
-            idx = sol.Value(routing.NextVar(idx))
-        if route:
-            routes.append(route)
-
+                stops.append(node)  # 1..n
+            idx = solution.Value(routing.NextVar(idx))
+        routes.append(stops)
     return routes
 
 
-def google_maps_link(start: Tuple[float, float], route_orders: List[Tuple[str, float, float]]) -> str:
-    parts = [f"{start[0]},{start[1]}"] + [f"{o[1]},{o[2]}" for o in route_orders]
-    return "https://www.google.com/maps/dir/" + "/".join(parts)
+def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float, float]]) -> str:
+    # Google Maps Directions API (simple URL)
+    # origin=depot, destination=last stop, waypoints=others
+    if not stops_latlon:
+        return ""
+    origin = f"{depot[0]},{depot[1]}"
+    dest = f"{stops_latlon[-1][0]},{stops_latlon[-1][1]}"
+    waypoints = ""
+    if len(stops_latlon) > 1:
+        waypoints = "|".join([f"{lat},{lon}" for (lat, lon) in stops_latlon[:-1]])
+    url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={dest}"
+    if waypoints:
+        url += f"&waypoints={waypoints}"
+    return url
 
 
-# =========================
-# BOT FLOW
-# =========================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Choisis le magasin (point de départ) :", reply_markup=shops_keyboard())
+# ----------------------------
+# Telegram UI helpers
+# ----------------------------
+def main_menu_kb() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("🆕 Nouveau trajet", callback_data="NEW")],
+        [InlineKeyboardButton("🔄 Actualisation", callback_data="REFRESH")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
 
-async def on_shop_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+def chunk_buttons(buttons: List[InlineKeyboardButton], per_row: int = 2) -> List[List[InlineKeyboardButton]]:
+    rows = []
+    for i in range(0, len(buttons), per_row):
+        rows.append(buttons[i:i+per_row])
+    return rows
 
-    shop_id = q.data.split(":", 1)[1]
-    shop = get_shop(shop_id)
-    if not shop:
-        await q.edit_message_text("❌ Magasin introuvable. Fais /start.")
-        return
 
-    context.user_data["start"] = (shop["lat"], shop["lon"])
-    context.user_data["shop_name"] = shop["name"]
+async def ensure_redash_cache(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> List[Dict]:
+    if (not force) and context.user_data.get(CTX_REDASH_CACHE):
+        return context.user_data[CTX_REDASH_CACHE]
 
-    await q.edit_message_text(
-        f"✅ Magasin choisi : {shop['name']}\n\nChoisis le nombre de livreurs :",
-        reply_markup=vehicles_keyboard(),
+    csv_text = fetch_redash_csv_text()
+    rows = parse_redash_rows(csv_text)
+    context.user_data[CTX_REDASH_CACHE] = rows
+    return rows
+
+
+async def ensure_stores(context: ContextTypes.DEFAULT_TYPE) -> List[Dict]:
+    if context.user_data.get(CTX_STORES):
+        return context.user_data[CTX_STORES]
+    stores = load_stores_from_csv(STORES_CSV_PATH)
+    context.user_data[CTX_STORES] = stores
+    return stores
+
+
+# ----------------------------
+# Handlers
+# ----------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_stores(context)
+    await update.message.reply_text(
+        "Bot Last Mile Bringo ✅\nChoisis une action :",
+        reply_markup=main_menu_kb()
     )
 
 
-async def on_vehicle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    k = int(q.data.split(":", 1)[1])
-    context.user_data["k"] = k
-
-    shop_name = context.user_data.get("shop_name", "Magasin")
-    await q.edit_message_text(
-        f"✅ Livreurs : {k}\n📍 Départ : {shop_name}\n\n"
-        "Maintenant envoie le fichier Excel (.xlsx) 📎\n"
-        "Colonnes obligatoires : order_id, lat, lon"
-    )
-
-
-async def on_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "start" not in context.user_data or "k" not in context.user_data:
-        await update.message.reply_text("❌ Fais /start d’abord (choisir magasin + livreurs).")
-        return
-
-    doc = update.message.document
-    if not doc or not doc.file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("❌ Envoie un fichier .xlsx (Excel).")
-        return
-
-    start_pt: Tuple[float, float] = context.user_data["start"]
-    k: int = context.user_data["k"]
-
-    tg_file = await doc.get_file()
-    with tempfile.TemporaryDirectory() as td:
-        path = os.path.join(td, doc.file_name)
-        await tg_file.download_to_drive(custom_path=path)
-
+    if q.data == "REFRESH":
+        # refresh redash cache
         try:
-            orders = read_orders_from_xlsx(path)
-            routes = solve_vrp_balanced(start_pt, orders, k)
-
-            out = []
-            for i, r in enumerate(routes, start=1):
-                route_orders = [orders[idx] for idx in r]
-                out.append(f"🚚 *Livreur {i}* ({len(route_orders)} commandes)")
-                out.append("Ordre : " + " → ".join([o[0] for o in route_orders]))
-                out.append("🔗 " + google_maps_link(start_pt, route_orders))
-                out.append("")
-
-            await update.message.reply_text(
-                "\n".join(out).strip(),
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
-
+            await ensure_redash_cache(context, force=True)
+            await q.edit_message_text("✅ Actualisation effectuée.", reply_markup=main_menu_kb())
         except Exception as e:
-            await update.message.reply_text(f"❌ Erreur VRP/Excel: {e}")
+            await q.edit_message_text(f"❌ Erreur actualisation Redash: {e}", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    if q.data == "NEW":
+        # start flow
+        await ensure_stores(context)
+        # also preload redash for slots
+        try:
+            await ensure_redash_cache(context, force=False)
+        except Exception:
+            pass
+
+        stores = context.user_data[CTX_STORES]
+        buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
+        kb = chunk_buttons(buttons, per_row=2)
+        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+        await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
+        return CHOOSE_STORE
+
+    return ConversationHandler.END
 
 
-# =========================
-# MAIN (Webhook stable)
-# =========================
-def main():
-    if not TOKEN:
-        raise SystemExit("BOT_TOKEN manquant dans Render (Environment Variables).")
-    if not PUBLIC_URL:
-        raise SystemExit("RENDER_EXTERNAL_URL manquant (Render le fournit automatiquement).")
+async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
 
-    app = Application.builder().token(TOKEN).build()
+    if q.data == "BACK_MENU":
+        await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
+        return ConversationHandler.END
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(on_shop_choice, pattern=r"^SHOP:"))
-    app.add_handler(CallbackQueryHandler(on_vehicle_choice, pattern=r"^VEH:"))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_excel))
+    if not q.data.startswith("STORE::"):
+        return CHOOSE_STORE
+
+    store_id = q.data.split("::", 1)[1]
+    stores = await ensure_stores(context)
+    store = next((s for s in stores if s["store_id"] == store_id), None)
+    if not store:
+        await q.edit_message_text("❌ Magasin introuvable. Réessaye.", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    context.user_data[CTX_STORE_NAME] = store["store_name"]
+    context.user_data[CTX_STORE_DEPOT] = (store["lat"], store["lon"])
+
+    # load redash and compute slots for this store
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    # ✅ Webhook server intégré (pas Flask) => évite "Event loop is closed"
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="",                  # racine "/"
-        webhook_url=f"{PUBLIC_URL}/", # Render external url
-        allowed_updates=Update.ALL_TYPES,
+        rows = await ensure_redash_cache(context, force=False)
+        slots = get_slots_for_store(rows, store["store_name"])
+    except Exception as e:
+        slots = []
+        log.exception(e)
+
+    # slot buttons
+    btns = [InlineKeyboardButton("📦 Tous les créneaux", callback_data="SLOT::__ALL__")]
+    for s in slots[:40]:  # safety
+        btns.append(InlineKeyboardButton(s, callback_data=f"SLOT::{s}"))
+
+    kb = chunk_buttons(btns, per_row=2)
+    kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
+
+    await q.edit_message_text(
+        f"🕒 Magasin: {store['store_name']}\nChoisis le créneau :",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    return CHOOSE_SLOT
+
+
+async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "BACK_STORES":
+        # show stores again
+        stores = await ensure_stores(context)
+        buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
+        kb = chunk_buttons(buttons, per_row=2)
+        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+        await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
+        return CHOOSE_STORE
+
+    if not q.data.startswith("SLOT::"):
+        return CHOOSE_SLOT
+
+    slot = q.data.split("::", 1)[1]
+    context.user_data[CTX_SLOT] = slot
+
+    # Ask drivers
+    btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, 11)]
+    kb = chunk_buttons(btns, per_row=5)
+    kb.append([InlineKeyboardButton("✍️ Saisir un nombre", callback_data="DRV::TEXT")])
+    kb.append([InlineKeyboardButton("⬅️ Retour créneaux", callback_data="BACK_SLOTS")])
+
+    store_name = context.user_data.get(CTX_STORE_NAME, "")
+    slot_label = "Tous" if slot == "__ALL__" else slot
+
+    await q.edit_message_text(
+        f"✅ Magasin: {store_name}\n✅ Créneau: {slot_label}\n\n🚴 Choisis le nombre de livreurs :",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    return CHOOSE_DRIVERS
+
+
+async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q:
+        await q.answer()
+
+        if q.data == "BACK_SLOTS":
+            # go back to slot selection
+            store_name = context.user_data.get(CTX_STORE_NAME)
+            if not store_name:
+                await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
+                return ConversationHandler.END
+
+            rows = await ensure_redash_cache(context, force=False)
+            slots = get_slots_for_store(rows, store_name)
+
+            btns = [InlineKeyboardButton("📦 Tous les créneaux", callback_data="SLOT::__ALL__")]
+            for s in slots[:40]:
+                btns.append(InlineKeyboardButton(s, callback_data=f"SLOT::{s}"))
+            kb = chunk_buttons(btns, per_row=2)
+            kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
+
+            await q.edit_message_text(
+                f"🕒 Magasin: {store_name}\nChoisis le créneau :",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return CHOOSE_SLOT
+
+        if q.data == "DRV::TEXT":
+            await q.edit_message_text("✍️ Envoie le nombre de livreurs (ex: 5).")
+            context.user_data["awaiting_drivers_text"] = True
+            return CHOOSE_DRIVERS
+
+        if q.data.startswith("DRV::"):
+            n = int(q.data.split("::", 1)[1])
+            context.user_data[CTX_NUM_DRIVERS] = n
+            return await run_planning_and_send(update, context, edit_from_query=True)
+
+    return CHOOSE_DRIVERS
+
+
+async def drivers_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_drivers_text"):
+        return
+
+    try:
+        n = int(update.message.text.strip())
+        if n < 1 or n > 50:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("❌ Nombre invalide. Envoie un entier entre 1 et 50.")
+        return
+
+    context.user_data["awaiting_drivers_text"] = False
+    context.user_data[CTX_NUM_DRIVERS] = n
+    return await run_planning_and_send(update, context, edit_from_query=False)
+
+
+async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_from_query: bool):
+    store_name = context.user_data.get(CTX_STORE_NAME)
+    depot = context.user_data.get(CTX_STORE_DEPOT)
+    slot = context.user_data.get(CTX_SLOT)
+    num_drivers = int(context.user_data.get(CTX_NUM_DRIVERS, 1))
+
+    if not store_name or not depot:
+        msg = "❌ Magasin manquant. Clique sur 🆕 Nouveau trajet."
+        if edit_from_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
+        else:
+            await update.message.reply_text(msg, reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    # Fetch & filter
+    try:
+        rows = await ensure_redash_cache(context, force=True)  # force refresh for planning
+    except Exception as e:
+        msg = f"❌ Impossible de récupérer Redash: {e}"
+        if edit_from_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
+        else:
+            await update.message.reply_text(msg, reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    orders = filter_orders(rows, store_name, slot)
+    if not orders:
+        slot_label = "Tous" if slot == "__ALL__" else slot
+        msg = f"⚠️ Aucune commande valide trouvée.\nMagasin: {store_name}\nCréneau: {slot_label}\n(Contrôle: Store + LatLong + Order Number)"
+        if edit_from_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
+        else:
+            await update.message.reply_text(msg, reply_markup=main_menu_kb())
+        return ConversationHandler.END
+    
+
+    # Solve
+    routes_nodes = solve_vrp(depot, orders, num_drivers)
+
+    # Build output
+    # orders list: index 1..n corresponds to orders[i-1]
+    lines = []
+    slot_label = "Tous" if slot == "__ALL__" else slot
+    lines.append(f"📍 Magasin: {store_name}")
+    lines.append(f"🕒 Créneau: {slot_label}")
+    lines.append(f"📦 Commandes: {len(orders)}")
+    lines.append(f"🚴 Livreurs: {num_drivers}")
+    lines.append("")
+
+    for v in range(num_drivers):
+        stops_nodes = routes_nodes[v]  # nodes 1..n
+        if not stops_nodes:
+            lines.append(f"👤 Livreur {v+1}: 0 commande")
+            lines.append("—")
+            continue
+
+        # map nodes to orders
+        stop_orders = [orders[node-1] for node in stops_nodes]  # (order_id, lat, lon)
+        ids = [o[0] for o in stop_orders]
+        latlons = [(o[1], o[2]) for o in stop_orders]
+
+        gmap = google_maps_link(depot, latlons)
+
+        lines.append(f"👤 Livreur {v+1}: {len(ids)} commandes")
+        lines.append("🧾 " + " → ".join(ids))
+        if gmap:
+            lines.append("🗺️ " + gmap)
+        lines.append("—")
+
+    text = "\n".join(lines)
+
+    if edit_from_query:
+        await update.callback_query.edit_message_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+    else:
+        await update.message.reply_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+
+    return ConversationHandler.END
+
+
+# ----------------------------
+# Flask Webhook bridge
+# ----------------------------
+flask_app = Flask(__name__)
+tg_app: Optional[Application] = None
+
+@flask_app.get("/")
+def health():
+    return "OK", 200
+
+@flask_app.post("/webhook")
+def webhook():
+    if tg_app is None:
+        return "Bot not ready", 503
+
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return "No JSON", 400
+
+    update = Update.de_json(data, tg_app.bot)
+    tg_app.update_queue.put_nowait(update)
+    return "OK", 200
+
+
+def build_telegram_app() -> Application:
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH)$"),
+        ],
+        states={
+            CHOOSE_STORE: [CallbackQueryHandler(choose_store, pattern="^(STORE::|BACK_MENU|BACK_STORES).*$")],
+            CHOOSE_SLOT: [CallbackQueryHandler(choose_slot, pattern="^(SLOT::|BACK_STORES).*$")],
+            CHOOSE_DRIVERS: [
+                CallbackQueryHandler(choose_drivers, pattern="^(DRV::|BACK_SLOTS).*$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, drivers_text),
+            ],
+        },
+        fallbacks=[CommandHandler("start", start)],
+        allow_reentry=True,
     )
 
+    application.add_handler(conv)
+    return application
 
+
+def main():
+    global tg_app
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_TOKEN env var")
+    if not WEBHOOK_URL:
+        raise RuntimeError("Missing WEBHOOK_URL env var (ex: https://xxx.onrender.com/webhook)")
+
+    tg_app = build_telegram_app()
+
+    # Set webhook once at startup
+    async def _set_webhook():
+        await tg_app.bot.set_webhook(url=WEBHOOK_URL)
+
+    tg_app.run_async(_set_webhook())
+
+    # Start PTB processing (without polling)
+    tg_app.run_async(tg_app.initialize())
+    tg_app.run_async(tg_app.start())
+
+    # Flask server is started by Render (gunicorn), not here.
+
+
+# Render will run with gunicorn, so main() isn't called automatically.
+# For local debugging: python app.py (you can add flask run manually)
 if __name__ == "__main__":
     main()
