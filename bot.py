@@ -45,6 +45,29 @@ REDASH_API_KEY = os.getenv("REDASH_API_KEY", "").strip()
 STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
 MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
 
+# ✅ Recommandation livreurs (heuristique)
+REC_MAX_STOPS_PER_DRIVER = int(os.getenv("REC_MAX_STOPS_PER_DRIVER", "8"))
+
+# ✅ Max livreurs autorisés par magasin (cap recommandation + choix)
+MAX_DRIVERS_BY_STORE = {
+    "Hyper Borj Fes": 1,
+    "Gourmet Zaers": 2,
+    "Hyper Dar Bouazza": 2,
+    "Hyper Sidi Maarouf": 5,
+    "Hyper Temara": 2,
+    "Hyper Salé": 2,
+    "Hyper Targa": 2,
+    "Hyper Al Mazar": 4,
+    "Hyper Tanger": 2,
+    "Hyper Tetouan": 1,
+    "Hyper Agadir": 2,
+    "Hyper Beni Mellal": 1,
+}
+
+def get_max_drivers_for_store(store_name: str) -> int:
+    """Retourne le max livreurs autorisés pour ce magasin (défaut: 10)."""
+    return int(MAX_DRIVERS_BY_STORE.get((store_name or "").strip(), 10))
+
 # ✅ Créneaux FIXES (pas de "Tous les créneaux")
 SLOTS_FIXED = [
     "10:00 - 12:00",
@@ -55,8 +78,8 @@ SLOTS_FIXED = [
     "20:00 - 22:00",
 ]
 
-# ✅ Business rules (as requested)
-REQUIRED_STATUS = "new"               # ONLY NEW (others ignored)
+# ✅ Business rules
+REQUIRED_STATUS = "new"                   # ONLY NEW (others ignored)
 REQUIRED_DELIVERY_TYPE = "planned order"  # Delivery Type must be Planned Order (case-insensitive)
 
 logging.basicConfig(level=logging.INFO)
@@ -181,8 +204,8 @@ def norm_text(s: str) -> str:
 
 def parse_redash_rows(csv_text: str) -> List[Dict]:
     """
-    Expected columns:
-    - Order Number
+    Expected columns (best-effort):
+    - Order Number (or Order)
     - Store
     - Status (we keep only NEW)
     - Delivery Type (must be Planned Order)
@@ -326,7 +349,7 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
     count_dim = routing.GetDimensionOrDie("Count")
     count_dim.SetGlobalSpanCostCoefficient(1000)
 
-    # 🔥 HARD BALANCING N/K (chaque livreur doit avoir ~ N/K commandes)
+    # HARD N/K
     n = len(orders)
     k = max(1, num_vehicles)
     min_load = n // k
@@ -336,7 +359,7 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
         end = routing.End(v)
         count_dim.CumulVar(end).SetRange(min_load, max_load)
 
-    # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité
+    # rendre les commandes "optionnelles" avec pénalité (fallback)
     penalty = 10**7
     for node in range(1, len(points)):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
@@ -563,15 +586,38 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slot = q.data.split("::", 1)[1]
     context.user_data[CTX_SLOT] = slot
 
-    btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, 11)]
+    store_name = context.user_data.get(CTX_STORE_NAME, "")
+    d = context.user_data.get(CTX_DATE, "")
+
+    max_allowed = get_max_drivers_for_store(store_name)
+    max_pick = min(10, max_allowed)
+
+    # ✅ Infos: nombre de commandes + recommandation livreurs
+    try:
+        rows = await ensure_redash_cache(context, force=False)
+        n_orders = len(filter_orders(rows, store_name, slot, d))
+    except Exception:
+        n_orders = 0
+
+    rec_drivers = max(1, int(math.ceil(n_orders / max(1, REC_MAX_STOPS_PER_DRIVER))))
+    rec_drivers = min(rec_drivers, max_allowed)
+
+    btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, max_pick + 1)]
     kb = chunk_buttons(btns, per_row=5)
     kb.append([InlineKeyboardButton("✍️ Saisir un nombre", callback_data="DRV::TEXT")])
     kb.append([InlineKeyboardButton("⬅️ Retour créneaux", callback_data="BACK_SLOTS")])
 
-    store_name = context.user_data.get(CTX_STORE_NAME, "")
-    d = context.user_data.get(CTX_DATE, "")
+    msg = (
+        f"✅ Magasin: {store_name}\n"
+        f"✅ Date: {d}\n"
+        f"✅ Créneau: {slot}\n"
+        f"✅ nombre de commande actuelle: {n_orders}\n"
+        f"✅ nombre de livreur recommender : {rec_drivers}\n\n"
+        "🚴 Choisis le nombre de livreurs :"
+    )
+
     await q.edit_message_text(
-        f"✅ Magasin: {store_name}\n✅ Date: {d}\n✅ Créneau: {slot}\n\n🚴 Choisis le nombre de livreurs :",
+        msg,
         reply_markup=InlineKeyboardMarkup(kb)
     )
     return CHOOSE_DRIVERS
@@ -600,7 +646,8 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return CHOOSE_SLOT
 
         if q.data == "DRV::TEXT":
-            await q.edit_message_text("✍️ Envoie le nombre de livreurs (ex: 5).")
+            max_allowed = get_max_drivers_for_store(context.user_data.get(CTX_STORE_NAME, ""))
+            await q.edit_message_text(f"✍️ Envoie le nombre de livreurs (max {max_allowed}).")
             context.user_data["awaiting_drivers_text"] = True
             return CHOOSE_DRIVERS
 
@@ -609,6 +656,11 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n = int(q.data.split("::", 1)[1])
             except Exception:
                 await q.edit_message_text("❌ Nombre invalide.", reply_markup=main_menu_kb())
+                return ConversationHandler.END
+
+            max_allowed = get_max_drivers_for_store(context.user_data.get(CTX_STORE_NAME, ""))
+            if n > max_allowed:
+                await q.edit_message_text(f"❌ Max livreurs pour ce magasin: {max_allowed}.", reply_markup=main_menu_kb())
                 return ConversationHandler.END
 
             context.user_data[CTX_NUM_DRIVERS] = n
@@ -621,12 +673,14 @@ async def drivers_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("awaiting_drivers_text"):
         return
 
+    max_allowed = get_max_drivers_for_store(context.user_data.get(CTX_STORE_NAME, ""))
+
     try:
         n = int(update.message.text.strip())
-        if n < 1 or n > 50:
+        if n < 1 or n > max_allowed:
             raise ValueError
     except Exception:
-        await update.message.reply_text("❌ Nombre invalide. Envoie un entier entre 1 et 50.")
+        await update.message.reply_text(f"❌ Nombre invalide. Envoie un entier entre 1 et {max_allowed}.")
         return
 
     context.user_data["awaiting_drivers_text"] = False
