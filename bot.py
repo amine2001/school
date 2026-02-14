@@ -317,6 +317,14 @@ def build_distance_matrix(points: List[Tuple[float, float]]) -> List[List[int]]:
 
 
 def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]], num_vehicles: int) -> List[List[int]]:
+    """Solve a capacitated VRP (distance) with load balancing (stops per vehicle).
+
+    Important: we keep an HARD upper bound (max stops per vehicle) but the lower bound is SOFT,
+    to avoid infeasibility when the user chooses a high number of vehicles.
+    """
+    if not orders or num_vehicles <= 0:
+        return [[] for _ in range(max(0, num_vehicles))]
+
     points = [depot] + [(lat, lon) for (_, lat, lon) in orders]
     dist = build_distance_matrix(points)
 
@@ -341,33 +349,47 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
     routing.AddDimension(
         count_idx,
         0,
-        len(orders),
+        len(orders),   # capacity upper bound (safe)
         True,
         "Count"
     )
 
     count_dim = routing.GetDimensionOrDie("Count")
+
+    # Encourage balanced loads (reduce max-min across vehicles)
     count_dim.SetGlobalSpanCostCoefficient(1000)
 
-    # HARD N/K
+    # Targets
     n = len(orders)
     k = max(1, num_vehicles)
-    min_load = n // k
-    max_load = math.ceil(n / k)
+    target_min = n // k
+    target_max = math.ceil(n / k)
 
+    # ✅ HARD upper bound only (always feasible)
     for v in range(num_vehicles):
         end = routing.End(v)
-        count_dim.CumulVar(end).SetRange(min_load, max_load)
+        count_dim.CumulVar(end).SetRange(0, target_max)
 
-    # rendre les commandes "optionnelles" avec pénalité (fallback)
+        # ✅ SOFT lower bound: penalize vehicles that take too few stops
+        # penalty is cost per missing stop (bigger => stronger balancing).
+        # Distances are in meters, so 200000 ~ 200km-equivalent penalty per missing stop.
+        try:
+            count_dim.SetCumulVarSoftLowerBound(end, target_min, 200000)
+        except Exception:
+            # If this OR-Tools build doesn't expose SoftLowerBound, we still remain feasible
+            pass
+
+    # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité (fallback)
     penalty = 10**7
     for node in range(1, len(points)):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+
+    # Better first solution for constrained / multi-vehicle cases
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(10)
+    params.time_limit.FromSeconds(15)
 
     solution = routing.SolveWithParameters(params)
     if not solution:
@@ -384,6 +406,8 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
             idx = solution.Value(routing.NextVar(idx))
         routes.append(stops)
     return routes
+
+
 
 
 def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float, float]]) -> str:
