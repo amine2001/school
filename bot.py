@@ -9,7 +9,6 @@ import asyncio
 import atexit
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
-from datetime import date
 
 import requests
 from flask import Flask, request
@@ -26,14 +25,6 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 
-async def safe_answer(q):
-    if not q:
-        return
-    try:
-        await q.answer(cache_time=0)
-    except BadRequest:
-        # callback trop vieux -> on ignore pour éviter crash
-        pass
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 # ============================
@@ -65,25 +56,40 @@ SLOTS_FIXED = [
 ]
 
 # ✅ Business rules (as requested)
-REQUIRED_STATUS = "new"               # ONLY NEW
+REQUIRED_STATUS = "new"               # ONLY NEW (others ignored)
 REQUIRED_DELIVERY_TYPE = "planned order"  # Delivery Type must be Planned Order (case-insensitive)
-ONLY_TODAY = True                     # Day Of Delivery must be today
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bringo-bot")
 
+
 # ============================
 # Telegram Conversation States
 # ============================
-(CHOOSE_STORE, CHOOSE_SLOT, CHOOSE_DRIVERS) = range(3)
+(CHOOSE_STORE, CHOOSE_DATE, CHOOSE_SLOT, CHOOSE_DRIVERS) = range(4)
 
 # context keys
 CTX_STORES = "stores"
 CTX_REDASH_CACHE = "redash_cache"
 CTX_STORE_NAME = "store_name"
 CTX_STORE_DEPOT = "store_depot"
+CTX_DATE = "date"
 CTX_SLOT = "slot"
 CTX_NUM_DRIVERS = "num_drivers"
+
+
+# ============================
+# Safe callback answer
+# ============================
+async def safe_answer(q):
+    if not q:
+        return
+    try:
+        await q.answer(cache_time=0)
+    except BadRequest:
+        # callback trop vieux / id invalide -> ignorer pour éviter crash
+        pass
+
 
 # ============================
 # Helpers: Stores CSV
@@ -110,6 +116,7 @@ def load_stores_from_csv(path: str) -> List[Dict]:
     stores.sort(key=lambda x: x["store_name"].lower())
     return stores
 
+
 # ============================
 # Helpers: Redash fetch
 # ============================
@@ -124,11 +131,13 @@ def _with_api_key(url: str) -> str:
     q["api_key"] = REDASH_API_KEY
     return urlunparse(u._replace(query=urlencode(q)))
 
+
 def fetch_redash_csv_text() -> str:
     url = _with_api_key(REDASH_RESULTS_CSV_URL)
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.text
+
 
 # ============================
 # Helpers: parse CSV rows
@@ -149,6 +158,7 @@ def parse_latlong(latlong: str) -> Optional[Tuple[float, float]]:
     except Exception:
         return None
 
+
 def _fmt_hhmm(v) -> Optional[str]:
     if v is None:
         return None
@@ -160,31 +170,23 @@ def _fmt_hhmm(v) -> Optional[str]:
         return s[:5]
     return None
 
+
 def norm_slot(s: str) -> str:
     return (s or "").lower().replace(" ", "").replace("–", "-").replace("--", "-")
+
 
 def norm_text(s: str) -> str:
     return (s or "").strip().lower()
 
-def today_str_variants() -> set:
-    """Match both dd/mm/yy and dd/mm/yyyy."""
-    d = date.today()
-    return {d.strftime("%d/%m/%y"), d.strftime("%d/%m/%Y")}
-
-def date_is_today(value: str) -> bool:
-    if not value:
-        return False
-    s = str(value).strip()
-    return s in today_str_variants()
 
 def parse_redash_rows(csv_text: str) -> List[Dict]:
     """
-    Expected columns (from your CSV):
+    Expected columns:
     - Order Number
     - Store
     - Status (we keep only NEW)
     - Delivery Type (must be Planned Order)
-    - Day Of Delivery (must be today)
+    - Day Of Delivery (we keep ALL dates; selection done in UI)
     - Debut De Creneau, Fin De Creneau -> build slot 'HH:MM - HH:MM'
     - LatLong (or Latitude/Longitude)
     """
@@ -214,19 +216,15 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
             except Exception:
                 ll = None
 
-        if not order_id or not store or not slot or not ll:
+        if not order_id or not store or not slot or not ll or not day_of_delivery:
             continue
 
-        # ✅ ONLY NEW
+        # ✅ ONLY NEW (others ignored)
         if status != REQUIRED_STATUS:
             continue
 
         # ✅ ONLY Planned Order
         if delivery_type != REQUIRED_DELIVERY_TYPE:
-            continue
-
-        # ✅ ONLY today
-        if ONLY_TODAY and (not date_is_today(day_of_delivery)):
             continue
 
         rows.append({
@@ -245,16 +243,29 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
         rows = rows[:MAX_ORDERS]
     return rows
 
-def filter_orders(rows: List[Dict], store_name: str, slot: str) -> List[Tuple[str, float, float]]:
+
+def available_dates_for_store(rows: List[Dict], store_name: str) -> List[str]:
+    dates = sorted({
+        (r.get("day_of_delivery") or "").strip()
+        for r in rows
+        if (r.get("store") or "").strip() == (store_name or "").strip()
+        and (r.get("day_of_delivery") or "").strip()
+    })
+    return dates
+
+
+def filter_orders(rows: List[Dict], store_name: str, slot: str, day_of_delivery: str) -> List[Tuple[str, float, float]]:
     out = []
     for r in rows:
         if (r["store"] or "").strip() != (store_name or "").strip():
             continue
+        if (r.get("day_of_delivery") or "").strip() != (day_of_delivery or "").strip():
+            continue
         if norm_slot(r["slot"]) != norm_slot(slot):
             continue
-        # (status/delivery_type/date already filtered in parse_redash_rows)
         out.append((r["order_id"], r["lat"], r["lon"]))
     return out
+
 
 # ============================
 # VRP utilities
@@ -268,6 +279,7 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
 
+
 def build_distance_matrix(points: List[Tuple[float, float]]) -> List[List[int]]:
     n = len(points)
     mat = [[0] * n for _ in range(n)]
@@ -280,27 +292,6 @@ def build_distance_matrix(points: List[Tuple[float, float]]) -> List[List[int]]:
             mat[i][j] = int(haversine_m(lat1, lon1, lat2, lon2))
     return mat
 
-def add_count_balance_dimension(routing, manager, num_orders):
-    def count_cb(from_index, to_index):
-        node = manager.IndexToNode(to_index)
-        return 0 if node == 0 else 1
-
-    count_idx = routing.RegisterTransitCallback(count_cb)
-    routing.AddDimension(count_idx, 0, num_orders, True, "Count")
-    count_dim = routing.GetDimensionOrDie("Count")
-    count_dim.SetGlobalSpanCostCoefficient(100)
-
-def force_min_one_stop_per_vehicle_if_possible(routing, manager, num_orders, num_vehicles):
-    if num_orders < num_vehicles:
-        return
-    solver = routing.solver()
-    order_nodes = range(1, num_orders + 1)
-    for v in range(num_vehicles):
-        served_by_v = [
-            solver.IsEqualCstVar(routing.VehicleVar(manager.NodeToIndex(i)), v)
-            for i in order_nodes
-        ]
-        solver.Add(solver.Sum(served_by_v) >= 1)
 
 def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]], num_vehicles: int) -> List[List[int]]:
     points = [depot] + [(lat, lon) for (_, lat, lon) in orders]
@@ -316,6 +307,7 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
 
     transit_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+
     # ✅ Balance des commandes (N/K)
     def count_cb(from_index, to_index):
         node = manager.IndexToNode(to_index)
@@ -333,24 +325,18 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
 
     count_dim = routing.GetDimensionOrDie("Count")
     count_dim.SetGlobalSpanCostCoefficient(1000)
+
     # 🔥 HARD BALANCING N/K (chaque livreur doit avoir ~ N/K commandes)
     n = len(orders)
-    k = num_vehicles
+    k = max(1, num_vehicles)
     min_load = n // k
     max_load = math.ceil(n / k)
 
     for v in range(num_vehicles):
         end = routing.End(v)
         count_dim.CumulVar(end).SetRange(min_load, max_load)
-    if n >= k:
-        min_load = n // k
-        max_load = math.ceil(n / k)
-        for v in range(num_vehicles):
-            end = routing.End(v)
-            count_dim.CumulVar(end).SetRange(min_load, max_load)
 
     # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité
-    # (permet au solveur de toujours trouver une solution et de répartir)
     penalty = 10**7
     for node in range(1, len(points)):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
@@ -390,6 +376,7 @@ def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float,
         url += f"&waypoints={waypoints}"
     return url
 
+
 # ============================
 # Telegram UI helpers
 # ============================
@@ -400,8 +387,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(kb)
 
+
 def chunk_buttons(buttons: List[InlineKeyboardButton], per_row: int = 2) -> List[List[InlineKeyboardButton]]:
-    return [buttons[i:i+per_row] for i in range(0, len(buttons), per_row)]
+    return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+
 
 async def ensure_redash_cache(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> List[Dict]:
     if (not force) and context.user_data.get(CTX_REDASH_CACHE):
@@ -411,12 +400,14 @@ async def ensure_redash_cache(context: ContextTypes.DEFAULT_TYPE, force: bool = 
     context.user_data[CTX_REDASH_CACHE] = rows
     return rows
 
+
 async def ensure_stores(context: ContextTypes.DEFAULT_TYPE) -> List[Dict]:
     if context.user_data.get(CTX_STORES):
         return context.user_data[CTX_STORES]
     stores = load_stores_from_csv(STORES_CSV_PATH)
     context.user_data[CTX_STORES] = stores
     return stores
+
 
 # ============================
 # Handlers
@@ -426,6 +417,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_stores(context)
     if update.message:
         await update.message.reply_text("Bot Last Mile Bringo ✅\nChoisis une action :", reply_markup=main_menu_kb())
+
 
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -450,6 +442,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+
 async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
@@ -470,17 +463,71 @@ async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data[CTX_STORE_NAME] = store["store_name"]
     context.user_data[CTX_STORE_DEPOT] = (store["lat"], store["lon"])
+    context.user_data.pop(CTX_DATE, None)
+    context.user_data.pop(CTX_SLOT, None)
 
-    # ✅ Créneaux FIXES uniquement
-    btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
+    # ✅ Proposer les dates disponibles (depuis Redash)
+    try:
+        rows = await ensure_redash_cache(context, force=True)
+    except Exception as e:
+        await q.edit_message_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    dates = available_dates_for_store(rows, store["store_name"])
+    if not dates:
+        await q.edit_message_text(
+            f"⚠️ Aucune date trouvée dans Redash pour {store['store_name']}.",
+            reply_markup=main_menu_kb()
+        )
+        return ConversationHandler.END
+
+    btns = [InlineKeyboardButton(d, callback_data=f"DATE::{d}") for d in dates]
     kb = chunk_buttons(btns, per_row=2)
     kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
+    kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
 
     await q.edit_message_text(
-        f"🕒 Magasin: {store['store_name']}\nChoisis le créneau :",
+        f"📍 Magasin: {store['store_name']}\n📅 Choisis la date :",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    return CHOOSE_DATE
+
+
+async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await safe_answer(q)
+
+    if q.data == "BACK_MENU":
+        await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    if q.data == "BACK_STORES":
+        stores = await ensure_stores(context)
+        buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
+        kb = chunk_buttons(buttons, per_row=2)
+        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+        await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
+        return CHOOSE_STORE
+
+    if not q.data.startswith("DATE::"):
+        return CHOOSE_DATE
+
+    d = q.data.split("::", 1)[1].strip()
+    context.user_data[CTX_DATE] = d
+    context.user_data.pop(CTX_SLOT, None)
+
+    # Proposer les créneaux
+    btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
+    kb = chunk_buttons(btns, per_row=2)
+    kb.append([InlineKeyboardButton("⬅️ Retour dates", callback_data="BACK_DATES")])
+
+    store_name = context.user_data.get(CTX_STORE_NAME, "")
+    await q.edit_message_text(
+        f"📍 Magasin: {store_name}\n📅 Date: {d}\n🕒 Choisis le créneau :",
         reply_markup=InlineKeyboardMarkup(kb)
     )
     return CHOOSE_SLOT
+
 
 async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -494,6 +541,22 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
         return CHOOSE_STORE
 
+    if q.data == "BACK_DATES":
+        store_name = context.user_data.get(CTX_STORE_NAME, "")
+        rows = await ensure_redash_cache(context, force=True)
+        dates = available_dates_for_store(rows, store_name)
+
+        btns = [InlineKeyboardButton(d, callback_data=f"DATE::{d}") for d in dates]
+        kb = chunk_buttons(btns, per_row=2)
+        kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
+        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+
+        await q.edit_message_text(
+            f"📍 Magasin: {store_name}\n📅 Choisis la date :",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return CHOOSE_DATE
+
     if not q.data.startswith("SLOT::"):
         return CHOOSE_SLOT
 
@@ -506,30 +569,32 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb.append([InlineKeyboardButton("⬅️ Retour créneaux", callback_data="BACK_SLOTS")])
 
     store_name = context.user_data.get(CTX_STORE_NAME, "")
+    d = context.user_data.get(CTX_DATE, "")
     await q.edit_message_text(
-        f"✅ Magasin: {store_name}\n✅ Créneau: {slot}\n\n🚴 Choisis le nombre de livreurs :",
+        f"✅ Magasin: {store_name}\n✅ Date: {d}\n✅ Créneau: {slot}\n\n🚴 Choisis le nombre de livreurs :",
         reply_markup=InlineKeyboardMarkup(kb)
     )
     return CHOOSE_DRIVERS
+
 
 async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q:
         await safe_answer(q)
 
-
         if q.data == "BACK_SLOTS":
             store_name = context.user_data.get(CTX_STORE_NAME)
-            if not store_name:
+            d = context.user_data.get(CTX_DATE)
+            if not store_name or not d:
                 await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
                 return ConversationHandler.END
 
             btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
             kb = chunk_buttons(btns, per_row=2)
-            kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
+            kb.append([InlineKeyboardButton("⬅️ Retour dates", callback_data="BACK_DATES")])
 
             await q.edit_message_text(
-                f"🕒 Magasin: {store_name}\nChoisis le créneau :",
+                f"📍 Magasin: {store_name}\n📅 Date: {d}\n🕒 Choisis le créneau :",
                 reply_markup=InlineKeyboardMarkup(kb)
             )
             return CHOOSE_SLOT
@@ -540,11 +605,17 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return CHOOSE_DRIVERS
 
         if q.data.startswith("DRV::"):
-            n = int(q.data.split("::", 1)[1])
+            try:
+                n = int(q.data.split("::", 1)[1])
+            except Exception:
+                await q.edit_message_text("❌ Nombre invalide.", reply_markup=main_menu_kb())
+                return ConversationHandler.END
+
             context.user_data[CTX_NUM_DRIVERS] = n
             return await run_planning_and_send(update, context, edit_from_query=True)
 
     return CHOOSE_DRIVERS
+
 
 async def drivers_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("awaiting_drivers_text"):
@@ -562,13 +633,15 @@ async def drivers_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[CTX_NUM_DRIVERS] = n
     return await run_planning_and_send(update, context, edit_from_query=False)
 
+
 async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_from_query: bool):
     store_name = context.user_data.get(CTX_STORE_NAME)
     depot = context.user_data.get(CTX_STORE_DEPOT)
+    day_of_delivery = context.user_data.get(CTX_DATE)
     slot = context.user_data.get(CTX_SLOT)
     num_drivers = int(context.user_data.get(CTX_NUM_DRIVERS, 1))
 
-    if not store_name or not depot or not slot:
+    if not store_name or not depot or not day_of_delivery or not slot:
         msg = "❌ Données manquantes. Clique sur 🆕 Nouveau trajet."
         if edit_from_query:
             await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
@@ -586,12 +659,14 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(msg, reply_markup=main_menu_kb())
         return ConversationHandler.END
 
-    orders = filter_orders(rows, store_name, slot)
+    orders = filter_orders(rows, store_name, slot, day_of_delivery)
     if not orders:
         msg = (
             f"⚠️ Aucune commande valide trouvée.\n"
-            f"Magasin: {store_name}\nCréneau: {slot}\n"
-            f"(Règles: Status=new + Delivery Type=Planned Order + Day Of Delivery=today + Lat/Lon + Créneau)"
+            f"Magasin: {store_name}\n"
+            f"Date: {day_of_delivery}\n"
+            f"Créneau: {slot}\n"
+            f"(Règles: Status=new + Delivery Type=Planned Order + Lat/Lon + Créneau + Date)"
         )
         if edit_from_query:
             await update.callback_query.edit_message_text(msg, reply_markup=main_menu_kb())
@@ -603,8 +678,9 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
 
     lines = [
         f"📍 Magasin: {store_name}",
+        f"📅 Date: {day_of_delivery}",
         f"🕒 Créneau: {slot}",
-        f"📦 Commandes (new/planned/today): {len(orders)}",
+        f"📦 Commandes (new/planned): {len(orders)}",
         f"🚴 Livreurs: {num_drivers}",
         "",
     ]
@@ -612,15 +688,15 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     for v in range(num_drivers):
         stops_nodes = routes_nodes[v]
         if not stops_nodes:
-            lines += [f"👤 Livreur {v+1}: 0 commande", "—"]
+            lines += [f"👤 Livreur {v + 1}: 0 commande", "—"]
             continue
 
-        stop_orders = [orders[node-1] for node in stops_nodes]
+        stop_orders = [orders[node - 1] for node in stops_nodes]
         ids = [o[0] for o in stop_orders]
         latlons = [(o[1], o[2]) for o in stop_orders]
         gmap = google_maps_link(depot, latlons)
 
-        lines.append(f"👤 Livreur {v+1}: {len(ids)} commandes")
+        lines.append(f"👤 Livreur {v + 1}: {len(ids)} commandes")
         lines.append("🧾 " + " → ".join(ids))
         if gmap:
             lines.append("🗺️ " + gmap)
@@ -635,6 +711,7 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
 
     return ConversationHandler.END
 
+
 # ============================
 # Build Telegram Application
 # ============================
@@ -648,10 +725,13 @@ def build_telegram_app() -> Application:
         ],
         states={
             CHOOSE_STORE: [
-                CallbackQueryHandler(choose_store, pattern="^(STORE::|BACK_MENU|BACK_STORES).*$")
+                CallbackQueryHandler(choose_store, pattern="^(STORE::|BACK_MENU).*$")
+            ],
+            CHOOSE_DATE: [
+                CallbackQueryHandler(choose_date, pattern="^(DATE::|BACK_STORES|BACK_MENU).*$")
             ],
             CHOOSE_SLOT: [
-                CallbackQueryHandler(choose_slot, pattern="^(SLOT::|BACK_STORES).*$")
+                CallbackQueryHandler(choose_slot, pattern="^(SLOT::|BACK_STORES|BACK_DATES).*$")
             ],
             CHOOSE_DRIVERS: [
                 CallbackQueryHandler(choose_drivers, pattern="^(DRV::|BACK_SLOTS).*$"),
@@ -665,6 +745,7 @@ def build_telegram_app() -> Application:
     application.add_handler(conv)
     return application
 
+
 # ============================================================
 # ✅ Render Webhook Bridge: Flask -> PTB.process_update
 # ============================================================
@@ -676,6 +757,7 @@ BOT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 READY = threading.Event()
 START_LOCK = threading.Lock()
 STARTED = False
+
 
 @flask_app.before_request
 def _ensure_bot_started():
@@ -691,17 +773,21 @@ def _ensure_bot_started():
         except Exception:
             log.exception("Failed to start PTB background thread")
 
+
 @flask_app.get("/")
 def health():
     return "OK", 200
+
 
 @flask_app.post("/webhook")
 def webhook():
     return _handle_update()
 
+
 @flask_app.post("/")
 def webhook_root():
     return _handle_update()
+
 
 def _handle_update():
     global ptb_app, BOT_LOOP
@@ -757,6 +843,7 @@ def _handle_update():
 
     return "OK", 200
 
+
 def _bot_thread():
     global ptb_app, BOT_LOOP
 
@@ -792,6 +879,7 @@ def _bot_thread():
         except Exception:
             pass
 
+
 def start_background_bot(wait_ready: bool = False):
     global STARTED
     with START_LOCK:
@@ -813,8 +901,10 @@ def start_background_bot(wait_ready: bool = False):
                     break
                 time.sleep(0.1)
 
+
 def _on_exit():
     log.info("Shutdown requested (atexit).")
+
 
 atexit.register(_on_exit)
 
