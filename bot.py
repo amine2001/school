@@ -4,6 +4,7 @@ import csv
 import math
 import time
 import logging
+import unicodedata
 import threading
 import asyncio
 import atexit
@@ -159,7 +160,11 @@ def fetch_redash_csv_text() -> str:
     url = _with_api_key(REDASH_RESULTS_CSV_URL)
     r = requests.get(url, timeout=60)
     r.raise_for_status()
-    return r.text
+    # ✅ Redash sometimes sends UTF-8 bytes but wrong headers; force UTF-8 to avoid mojibake (SalÃ©)
+    try:
+        return r.content.decode('utf-8')
+    except Exception:
+        return r.text
 
 
 # ============================
@@ -202,6 +207,27 @@ def norm_text(s: str) -> str:
     return (s or "").strip().lower()
 
 
+def fix_mojibake(s: str) -> str:
+    """Fix common UTF-8 decoded as Latin-1/Windows-1252 issues (e.g., 'SalÃ©' -> 'Salé')."""
+    if not s:
+        return ""
+    s = str(s)
+    if any(ch in s for ch in ("Ã", "Â", " ")):
+        try:
+            return s.encode("latin1").decode("utf-8")
+        except Exception:
+            return s
+    return s
+
+def norm_key(s: str) -> str:
+    """Normalize text for matching (case/accents/mojibake/extra spaces)."""
+    s = fix_mojibake(s)
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+    s = ' '.join(s.strip().lower().split())
+    return s
+
+
 def parse_redash_rows(csv_text: str) -> List[Dict]:
     """
     Expected columns (best-effort):
@@ -219,7 +245,7 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
     rows = []
     for row in reader:
         order_id = (row.get("Order Number") or row.get("Order") or "").strip()
-        store = (row.get("Store") or "").strip()
+        store = fix_mojibake((row.get("Store") or "").strip())
 
         status = norm_text(row.get("Status"))
         delivery_type = norm_text(row.get("Delivery Type"))
@@ -271,7 +297,7 @@ def available_dates_for_store(rows: List[Dict], store_name: str) -> List[str]:
     dates = sorted({
         (r.get("day_of_delivery") or "").strip()
         for r in rows
-        if (r.get("store") or "").strip() == (store_name or "").strip()
+        if norm_key(r.get("store") or "") == norm_key(store_name or "")
         and (r.get("day_of_delivery") or "").strip()
     })
     return dates
@@ -280,7 +306,7 @@ def available_dates_for_store(rows: List[Dict], store_name: str) -> List[str]:
 def filter_orders(rows: List[Dict], store_name: str, slot: str, day_of_delivery: str) -> List[Tuple[str, float, float]]:
     out = []
     for r in rows:
-        if (r["store"] or "").strip() != (store_name or "").strip():
+        if norm_key(r["store"] or "") != norm_key(store_name or ""):
             continue
         if (r.get("day_of_delivery") or "").strip() != (day_of_delivery or "").strip():
             continue
