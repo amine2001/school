@@ -4,7 +4,6 @@ import csv
 import math
 import time
 import logging
-import unicodedata
 import threading
 import asyncio
 import atexit
@@ -46,29 +45,6 @@ REDASH_API_KEY = os.getenv("REDASH_API_KEY", "").strip()
 STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
 MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
 
-# ✅ Recommandation livreurs (heuristique)
-REC_MAX_STOPS_PER_DRIVER = int(os.getenv("REC_MAX_STOPS_PER_DRIVER", "8"))
-
-# ✅ Max livreurs autorisés par magasin (cap recommandation + choix)
-MAX_DRIVERS_BY_STORE = {
-    "Hyper Borj Fes": 1,
-    "Gourmet Zaers": 2,
-    "Hyper Dar Bouazza": 2,
-    "Hyper Sidi Maarouf": 5,
-    "Hyper Temara": 2,
-    "Hyper Salé": 2,
-    "Hyper Targa": 2,
-    "Hyper Al Mazar": 4,
-    "Hyper Tanger": 2,
-    "Hyper Tetouan": 1,
-    "Hyper Agadir": 2,
-    "Hyper Beni Mellal": 1,
-}
-
-def get_max_drivers_for_store(store_name: str) -> int:
-    """Retourne le max livreurs autorisés pour ce magasin (défaut: 10)."""
-    return int(MAX_DRIVERS_BY_STORE.get((store_name or "").strip(), 10))
-
 # ✅ Créneaux FIXES (pas de "Tous les créneaux")
 SLOTS_FIXED = [
     "10:00 - 12:00",
@@ -79,8 +55,8 @@ SLOTS_FIXED = [
     "20:00 - 22:00",
 ]
 
-# ✅ Business rules
-REQUIRED_STATUS = "new"                   # ONLY NEW (others ignored)
+# ✅ Business rules (as requested)
+REQUIRED_STATUS = "new"               # ONLY NEW (others ignored)
 REQUIRED_DELIVERY_TYPE = "planned order"  # Delivery Type must be Planned Order (case-insensitive)
 
 logging.basicConfig(level=logging.INFO)
@@ -90,11 +66,12 @@ log = logging.getLogger("bringo-bot")
 # ============================
 # Telegram Conversation States
 # ============================
-(CHOOSE_STORE, CHOOSE_DATE, CHOOSE_SLOT, CHOOSE_DRIVERS) = range(4)
+(CHOOSE_STORE, CHOOSE_DATE, CHOOSE_SLOT, CHOOSE_DRIVERS, ORDERS_MENU, ORDER_INPUT) = range(6)
 
 # context keys
 CTX_STORES = "stores"
 CTX_REDASH_CACHE = "redash_cache"
+CTX_REDASH_ALL_CACHE = "redash_all_cache"  # for order lookup (all statuses/types)
 CTX_STORE_NAME = "store_name"
 CTX_STORE_DEPOT = "store_depot"
 CTX_DATE = "date"
@@ -160,11 +137,7 @@ def fetch_redash_csv_text() -> str:
     url = _with_api_key(REDASH_RESULTS_CSV_URL)
     r = requests.get(url, timeout=60)
     r.raise_for_status()
-    # ✅ Redash sometimes sends UTF-8 bytes but wrong headers; force UTF-8 to avoid mojibake (SalÃ©)
-    try:
-        return r.content.decode('utf-8')
-    except Exception:
-        return r.text
+    return r.text
 
 
 # ============================
@@ -207,31 +180,10 @@ def norm_text(s: str) -> str:
     return (s or "").strip().lower()
 
 
-def fix_mojibake(s: str) -> str:
-    """Fix common UTF-8 decoded as Latin-1/Windows-1252 issues (e.g., 'SalÃ©' -> 'Salé')."""
-    if not s:
-        return ""
-    s = str(s)
-    if any(ch in s for ch in ("Ã", "Â", " ")):
-        try:
-            return s.encode("latin1").decode("utf-8")
-        except Exception:
-            return s
-    return s
-
-def norm_key(s: str) -> str:
-    """Normalize text for matching (case/accents/mojibake/extra spaces)."""
-    s = fix_mojibake(s)
-    s = unicodedata.normalize('NFD', s)
-    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
-    s = ' '.join(s.strip().lower().split())
-    return s
-
-
 def parse_redash_rows(csv_text: str) -> List[Dict]:
     """
-    Expected columns (best-effort):
-    - Order Number (or Order)
+    Expected columns:
+    - Order Number
     - Store
     - Status (we keep only NEW)
     - Delivery Type (must be Planned Order)
@@ -245,7 +197,7 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
     rows = []
     for row in reader:
         order_id = (row.get("Order Number") or row.get("Order") or "").strip()
-        store = fix_mojibake((row.get("Store") or "").strip())
+        store = (row.get("Store") or "").strip()
 
         status = norm_text(row.get("Status"))
         delivery_type = norm_text(row.get("Delivery Type"))
@@ -293,11 +245,185 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
     return rows
 
 
+
+
+# ============================
+# Order lookup: parse ALL rows (no filters on status/type/date)
+# ============================
+def _parse_dt(s: str):
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s or s.lower() == "nan":
+        return None
+    # common formats in your Redash exports
+    fmts = [
+        "%d/%m/%y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%y %H:%M",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ]
+    for f in fmts:
+        try:
+            return datetime.datetime.strptime(s, f)
+        except Exception:
+            pass
+    return None
+
+def parse_redash_rows_all(csv_text: str) -> List[Dict]:
+    """Keep all orders for per-order queries (payment/status/e2e)."""
+    f = io.StringIO(csv_text)
+    reader = csv.DictReader(f)
+    out = []
+    for row in reader:
+        order_id = (row.get("Order Number") or row.get("Order") or "").strip()
+        if not order_id:
+            continue
+        store = fix_mojibake((row.get("Store") or "").strip())
+        status = norm_text(row.get("Status"))
+        delivery_type = norm_text(row.get("Delivery Type"))
+        day_of_delivery = (row.get("Day Of Delivery") or "").strip()
+
+        initial_amount = row.get("Initial Amount")
+        total_paid = row.get("Total Amount Paid")
+
+        # Timestamps for steps
+        order_date = _parse_dt(row.get("Order Date"))
+        accept_dt = _parse_dt(row.get("Date d'acceptation prep"))
+        prep_end_dt = _parse_dt(row.get("Order Preparation End"))
+        load_dt = _parse_dt(row.get("Chargement date"))
+        close_dt = _parse_dt(row.get("Date de cloture"))
+
+        def _to_float(x):
+            try:
+                if x is None:
+                    return None
+                s = str(x).strip().replace(" ", "").replace(",", ".")
+                if not s:
+                    return None
+                return float(s)
+            except Exception:
+                return None
+
+        out.append({
+            "order_id": order_id,
+            "store": store,
+            "status": status,
+            "delivery_type": delivery_type,
+            "day_of_delivery": day_of_delivery,
+            "initial_amount": _to_float(initial_amount),
+            "total_paid": _to_float(total_paid),
+            "order_date": order_date,
+            "accept_dt": accept_dt,
+            "prep_end_dt": prep_end_dt,
+            "load_dt": load_dt,
+            "close_dt": close_dt,
+            "etat_picker": norm_text(row.get("Etat Picker")),
+            "etat_shopper": norm_text(row.get("Etat Shopper")),
+            "raw": row,
+        })
+    return out
+
+async def ensure_redash_all_cache(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> List[Dict]:
+    if (not force) and context.user_data.get(CTX_REDASH_ALL_CACHE):
+        return context.user_data[CTX_REDASH_ALL_CACHE]
+    csv_text = fetch_redash_csv_text()
+    rows_all = parse_redash_rows_all(csv_text)
+    context.user_data[CTX_REDASH_ALL_CACHE] = rows_all
+    return rows_all
+
+def find_order(rows_all: List[Dict], order_number: str) -> Optional[Dict]:
+    target = (order_number or "").strip()
+    if not target:
+        return None
+    for r in rows_all:
+        if str(r.get("order_id", "")).strip() == target:
+            return r
+    return None
+
+def _fmt_dt(dt):
+    if not dt:
+        return "-"
+    return dt.strftime("%d/%m/%y %H:%M")
+
+def _fmt_duration(td: datetime.timedelta) -> str:
+    mins = int(td.total_seconds() // 60)
+    h = mins // 60
+    m = mins % 60
+    if h <= 0:
+        return f"{m} min"
+    return f"{h}h {m:02d}m"
+
+def compute_e2e(order: Dict) -> str:
+    """End-to-End: delivery_time - start_time.
+    Planned Order: start=accept_dt (fallback order_date)
+    Express: start=order_date
+    End: close_dt if exists else now.
+    """
+    now = datetime.datetime.utcnow()
+    dt_end = order.get("close_dt") or now
+    dtype = (order.get("delivery_type") or "").lower()
+    if dtype == "planned order":
+        dt_start = order.get("accept_dt") or order.get("order_date")
+    else:
+        dt_start = order.get("order_date")
+    if not dt_start:
+        return "Impossible à calculer (date de départ manquante)."
+    td = dt_end - dt_start
+    delivered = "✅ Livrée" if order.get("close_dt") else "⏳ Pas encore livrée"
+    return f"{delivered} • { _fmt_duration(td) } (de {_fmt_dt(dt_start)} à {_fmt_dt(order.get('close_dt') or now)})"
+
+def compute_payment(order: Dict) -> str:
+    init_amt = order.get("initial_amount")
+    paid = order.get("total_paid")
+    etat = (order.get("etat_shopper") or "")
+    is_paid = False
+    if isinstance(init_amt, (int, float)) and isinstance(paid, (int, float)):
+        if paid >= init_amt and paid > 0:
+            is_paid = True
+    if etat in ("store_paid", "customer_paid", "complete"):
+        is_paid = True
+    if is_paid:
+        return f"✅ Payé (Total payé: {paid} / Montant: {init_amt})"
+    return f"❌ Non payé (Total payé: {paid} / Montant: {init_amt})"
+
+def compute_step_status(order: Dict) -> List[str]:
+    """Return lines for Acceptance/Preparation/Chargement/Livraison with retard logic."""
+    now = datetime.datetime.utcnow()
+    order_date = order.get("order_date")
+    accept_dt = order.get("accept_dt")
+    prep_end = order.get("prep_end_dt")
+    load_dt = order.get("load_dt")
+    close_dt = order.get("close_dt")
+
+    def line(label, done_dt, ref_dt, max_min):
+        if done_dt:
+            return f"✅ {label}: OK ({_fmt_dt(done_dt)})"
+        # not done
+        if not ref_dt:
+            return f"⚠️ {label}: En attente (référence manquante)"
+        late = (now - ref_dt).total_seconds() > max_min * 60
+        if late:
+            return f"🚨 {label}: Retard (>{max_min} min)"
+        return f"⏳ {label}: En cours"
+
+    # Acceptance reference: order_date
+    lines = []
+    lines.append(line("Acceptation", accept_dt, order_date, ACCEPT_MAX_MIN))
+    # Preparation reference: accept_dt
+    lines.append(line("Préparation", prep_end, accept_dt or order_date, PREP_MAX_MIN))
+    # Chargement reference: prep_end
+    lines.append(line("Chargement", load_dt, prep_end or accept_dt or order_date, LOAD_MAX_MIN))
+    # Livraison reference: load_dt
+    lines.append(line("Livraison", close_dt, load_dt or prep_end or accept_dt or order_date, DELIV_MAX_MIN))
+    return lines
 def available_dates_for_store(rows: List[Dict], store_name: str) -> List[str]:
     dates = sorted({
         (r.get("day_of_delivery") or "").strip()
         for r in rows
-        if norm_key(r.get("store") or "") == norm_key(store_name or "")
+        if (r.get("store") or "").strip() == (store_name or "").strip()
         and (r.get("day_of_delivery") or "").strip()
     })
     return dates
@@ -306,7 +432,7 @@ def available_dates_for_store(rows: List[Dict], store_name: str) -> List[str]:
 def filter_orders(rows: List[Dict], store_name: str, slot: str, day_of_delivery: str) -> List[Tuple[str, float, float]]:
     out = []
     for r in rows:
-        if norm_key(r["store"] or "") != norm_key(store_name or ""):
+        if (r["store"] or "").strip() != (store_name or "").strip():
             continue
         if (r.get("day_of_delivery") or "").strip() != (day_of_delivery or "").strip():
             continue
@@ -343,14 +469,6 @@ def build_distance_matrix(points: List[Tuple[float, float]]) -> List[List[int]]:
 
 
 def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]], num_vehicles: int) -> List[List[int]]:
-    """Solve a capacitated VRP (distance) with load balancing (stops per vehicle).
-
-    Important: we keep an HARD upper bound (max stops per vehicle) but the lower bound is SOFT,
-    to avoid infeasibility when the user chooses a high number of vehicles.
-    """
-    if not orders or num_vehicles <= 0:
-        return [[] for _ in range(max(0, num_vehicles))]
-
     points = [depot] + [(lat, lon) for (_, lat, lon) in orders]
     dist = build_distance_matrix(points)
 
@@ -375,47 +493,33 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
     routing.AddDimension(
         count_idx,
         0,
-        len(orders),   # capacity upper bound (safe)
+        len(orders),
         True,
         "Count"
     )
 
     count_dim = routing.GetDimensionOrDie("Count")
-
-    # Encourage balanced loads (reduce max-min across vehicles)
     count_dim.SetGlobalSpanCostCoefficient(1000)
 
-    # Targets
+    # 🔥 HARD BALANCING N/K (chaque livreur doit avoir ~ N/K commandes)
     n = len(orders)
     k = max(1, num_vehicles)
-    target_min = n // k
-    target_max = math.ceil(n / k)
+    min_load = n // k
+    max_load = math.ceil(n / k)
 
-    # ✅ HARD upper bound only (always feasible)
     for v in range(num_vehicles):
         end = routing.End(v)
-        count_dim.CumulVar(end).SetRange(0, target_max)
+        count_dim.CumulVar(end).SetRange(min_load, max_load)
 
-        # ✅ SOFT lower bound: penalize vehicles that take too few stops
-        # penalty is cost per missing stop (bigger => stronger balancing).
-        # Distances are in meters, so 200000 ~ 200km-equivalent penalty per missing stop.
-        try:
-            count_dim.SetCumulVarSoftLowerBound(end, target_min, 200000)
-        except Exception:
-            # If this OR-Tools build doesn't expose SoftLowerBound, we still remain feasible
-            pass
-
-    # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité (fallback)
+    # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité
     penalty = 10**7
     for node in range(1, len(points)):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-
-    # Better first solution for constrained / multi-vehicle cases
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(15)
+    params.time_limit.FromSeconds(10)
 
     solution = routing.SolveWithParameters(params)
     if not solution:
@@ -432,8 +536,6 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
             idx = solution.Value(routing.NextVar(idx))
         routes.append(stops)
     return routes
-
-
 
 
 def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float, float]]) -> str:
@@ -456,6 +558,7 @@ def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float,
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("🆕 Nouveau trajet", callback_data="NEW")],
+        [InlineKeyboardButton("📦 Commande", callback_data="CMD_MENU")],
         [InlineKeyboardButton("🔄 Actualisation", callback_data="REFRESH")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -503,6 +606,91 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await q.edit_message_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
         return ConversationHandler.END
+
+
+def commande_menu_kb() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("⏱ End to End", callback_data="CMD::E2E")],
+        [InlineKeyboardButton("💳 Paiement", callback_data="CMD::PAY")],
+        [InlineKeyboardButton("📌 Statut", callback_data="CMD::STATUS")],
+        [InlineKeyboardButton("⬅️ Menu", callback_data="CMD::BACK")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+async def on_cmd_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await safe_answer(q)
+
+    if q.data == "CMD::BACK":
+        await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    # store chosen mode
+    if q.data == "CMD::E2E":
+        context.user_data["cmd_mode"] = "E2E"
+        await q.edit_message_text("✍️ Envoie le numéro de commande pour calculer End-to-End.")
+        context.user_data["awaiting_order_number"] = True
+        return ORDER_INPUT
+
+    if q.data == "CMD::PAY":
+        context.user_data["cmd_mode"] = "PAY"
+        await q.edit_message_text("✍️ Envoie le numéro de commande pour vérifier le paiement.")
+        context.user_data["awaiting_order_number"] = True
+        return ORDER_INPUT
+
+    if q.data == "CMD::STATUS":
+        context.user_data["cmd_mode"] = "STATUS"
+        await q.edit_message_text("✍️ Envoie le numéro de commande pour afficher le statut détaillé.")
+        context.user_data["awaiting_order_number"] = True
+        return ORDER_INPUT
+
+    return ORDERS_MENU
+
+
+async def order_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_order_number"):
+        return
+
+    order_no = (update.message.text or "").strip()
+    if not order_no.isdigit():
+        await update.message.reply_text("❌ Envoie un numéro de commande valide (chiffres seulement).")
+        return
+
+    try:
+        rows_all = await ensure_redash_all_cache(context, force=True)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
+        context.user_data["awaiting_order_number"] = False
+        return ConversationHandler.END
+
+    order = find_order(rows_all, order_no)
+    if not order:
+        await update.message.reply_text("⚠️ Commande introuvable dans Redash (vérifie le numéro).", reply_markup=main_menu_kb())
+        context.user_data["awaiting_order_number"] = False
+        return ConversationHandler.END
+
+    mode = context.user_data.get("cmd_mode", "")
+    header = f"📦 Commande {order_no}\n🏬 {order.get('store','-')}\n📅 Day Of Delivery: {order.get('day_of_delivery','-')}\n"
+
+    if mode == "E2E":
+        res = compute_e2e(order)
+        msg = header + "\n⏱ End-to-End:\n" + res
+
+    elif mode == "PAY":
+        res = compute_payment(order)
+        msg = header + "\n💳 Paiement:\n" + res
+
+    else:  # STATUS
+        lines = compute_step_status(order)
+        msg = header + "\n📌 Statut détaillé:\n" + "\n".join(lines)
+
+    await update.message.reply_text(msg, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+    context.user_data["awaiting_order_number"] = False
+    return ConversationHandler.END
+    if q.data == "CMD_MENU":
+        await q.edit_message_text("📦 Commande — choisis une option :", reply_markup=commande_menu_kb())
+        return ORDERS_MENU
 
     if q.data == "NEW":
         await ensure_stores(context)
@@ -636,38 +824,15 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slot = q.data.split("::", 1)[1]
     context.user_data[CTX_SLOT] = slot
 
-    store_name = context.user_data.get(CTX_STORE_NAME, "")
-    d = context.user_data.get(CTX_DATE, "")
-
-    max_allowed = get_max_drivers_for_store(store_name)
-    max_pick = min(10, max_allowed)
-
-    # ✅ Infos: nombre de commandes + recommandation livreurs
-    try:
-        rows = await ensure_redash_cache(context, force=False)
-        n_orders = len(filter_orders(rows, store_name, slot, d))
-    except Exception:
-        n_orders = 0
-
-    rec_drivers = max(1, int(math.ceil(n_orders / max(1, REC_MAX_STOPS_PER_DRIVER))))
-    rec_drivers = min(rec_drivers, max_allowed)
-
-    btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, max_pick + 1)]
+    btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, 11)]
     kb = chunk_buttons(btns, per_row=5)
     kb.append([InlineKeyboardButton("✍️ Saisir un nombre", callback_data="DRV::TEXT")])
     kb.append([InlineKeyboardButton("⬅️ Retour créneaux", callback_data="BACK_SLOTS")])
 
-    msg = (
-        f"✅ Magasin: {store_name}\n"
-        f"✅ Date: {d}\n"
-        f"✅ Créneau: {slot}\n"
-        f"✅ nombre de commande actuelle: {n_orders}\n"
-        f"✅ nombre de livreur recommender : {rec_drivers}\n\n"
-        "🚴 Choisis le nombre de livreurs :"
-    )
-
+    store_name = context.user_data.get(CTX_STORE_NAME, "")
+    d = context.user_data.get(CTX_DATE, "")
     await q.edit_message_text(
-        msg,
+        f"✅ Magasin: {store_name}\n✅ Date: {d}\n✅ Créneau: {slot}\n\n🚴 Choisis le nombre de livreurs :",
         reply_markup=InlineKeyboardMarkup(kb)
     )
     return CHOOSE_DRIVERS
@@ -696,8 +861,7 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return CHOOSE_SLOT
 
         if q.data == "DRV::TEXT":
-            max_allowed = get_max_drivers_for_store(context.user_data.get(CTX_STORE_NAME, ""))
-            await q.edit_message_text(f"✍️ Envoie le nombre de livreurs (max {max_allowed}).")
+            await q.edit_message_text("✍️ Envoie le nombre de livreurs (ex: 5).")
             context.user_data["awaiting_drivers_text"] = True
             return CHOOSE_DRIVERS
 
@@ -706,11 +870,6 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n = int(q.data.split("::", 1)[1])
             except Exception:
                 await q.edit_message_text("❌ Nombre invalide.", reply_markup=main_menu_kb())
-                return ConversationHandler.END
-
-            max_allowed = get_max_drivers_for_store(context.user_data.get(CTX_STORE_NAME, ""))
-            if n > max_allowed:
-                await q.edit_message_text(f"❌ Max livreurs pour ce magasin: {max_allowed}.", reply_markup=main_menu_kb())
                 return ConversationHandler.END
 
             context.user_data[CTX_NUM_DRIVERS] = n
@@ -723,14 +882,12 @@ async def drivers_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("awaiting_drivers_text"):
         return
 
-    max_allowed = get_max_drivers_for_store(context.user_data.get(CTX_STORE_NAME, ""))
-
     try:
         n = int(update.message.text.strip())
-        if n < 1 or n > max_allowed:
+        if n < 1 or n > 50:
             raise ValueError
     except Exception:
-        await update.message.reply_text(f"❌ Nombre invalide. Envoie un entier entre 1 et {max_allowed}.")
+        await update.message.reply_text("❌ Nombre invalide. Envoie un entier entre 1 et 50.")
         return
 
     context.user_data["awaiting_drivers_text"] = False
@@ -825,7 +982,7 @@ def build_telegram_app() -> Application:
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_cmd),
-            CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH)$"),
+            CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH|CMD_MENU)$"),
         ],
         states={
             CHOOSE_STORE: [
@@ -841,6 +998,14 @@ def build_telegram_app() -> Application:
                 CallbackQueryHandler(choose_drivers, pattern="^(DRV::|BACK_SLOTS).*$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, drivers_text),
             ],
+
+ORDERS_MENU: [
+    CallbackQueryHandler(on_cmd_menu_click, pattern="^CMD::(E2E|PAY|STATUS|BACK)$"),
+],
+ORDER_INPUT: [
+    MessageHandler(filters.TEXT & ~filters.COMMAND, order_input_text),
+],
+
         },
         fallbacks=[CommandHandler("start", start_cmd)],
         allow_reentry=True,
