@@ -595,6 +595,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bot Last Mile Bringo ✅\nChoisis une action :", reply_markup=main_menu_kb())
 
 
+
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
@@ -606,8 +607,6 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await q.edit_message_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
         return ConversationHandler.END
-
-
 def commande_menu_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("⏱ End to End", callback_data="CMD::E2E")],
@@ -688,22 +687,6 @@ async def order_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=main_menu_kb(), disable_web_page_preview=True)
     context.user_data["awaiting_order_number"] = False
     return ConversationHandler.END
-    if q.data == "CMD_MENU":
-        await q.edit_message_text("📦 Commande — choisis une option :", reply_markup=commande_menu_kb())
-        return ORDERS_MENU
-
-    if q.data == "NEW":
-        await ensure_stores(context)
-        stores = context.user_data[CTX_STORES]
-        buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
-        kb = chunk_buttons(buttons, per_row=2)
-        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
-        await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
-        return CHOOSE_STORE
-
-    return ConversationHandler.END
-
-
 async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
@@ -998,14 +981,12 @@ def build_telegram_app() -> Application:
                 CallbackQueryHandler(choose_drivers, pattern="^(DRV::|BACK_SLOTS).*$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, drivers_text),
             ],
-
-ORDERS_MENU: [
-    CallbackQueryHandler(on_cmd_menu_click, pattern="^CMD::(E2E|PAY|STATUS|BACK)$"),
-],
-ORDER_INPUT: [
-    MessageHandler(filters.TEXT & ~filters.COMMAND, order_input_text),
-],
-
+            ORDERS_MENU: [
+                CallbackQueryHandler(on_cmd_menu_click, pattern="^CMD::(E2E|PAY|STATUS|BACK)$"),
+            ],
+            ORDER_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_input_text),
+            ],
         },
         fallbacks=[CommandHandler("start", start_cmd)],
         allow_reentry=True,
