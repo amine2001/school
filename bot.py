@@ -60,6 +60,15 @@ SLOTS_FIXED = [
 REQUIRED_STATUS = "new"               # ONLY NEW (others ignored)
 REQUIRED_DELIVERY_TYPE = "planned order"  # Delivery Type must be Planned Order (case-insensitive)
 
+# ============================
+# SLA thresholds (minutes) for "Commande > Statut"
+# Can be overridden via env vars
+# ============================
+ACCEPT_MAX_MIN = int(os.getenv("ACCEPT_MAX_MIN", "10"))
+PREP_MAX_MIN   = int(os.getenv("PREP_MAX_MIN",   "60"))
+LOAD_MAX_MIN   = int(os.getenv("LOAD_MAX_MIN",   "20"))
+DELIV_MAX_MIN  = int(os.getenv("DELIV_MAX_MIN",  "120"))
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bringo-bot")
 
@@ -371,23 +380,26 @@ def _fmt_duration(td: datetime.timedelta) -> str:
     return f"{h}h {m:02d}m"
 
 def compute_e2e(order: Dict) -> str:
-    """End-to-End: delivery_time - start_time.
-    Planned Order: start=accept_dt (fallback order_date)
-    Express: start=order_date
-    End: close_dt if exists else now.
+    """End-to-End **EXPRESS ONLY**:
+    duration = (close_dt or now) - order_date
+    If not EXPRESS, returns a clear message.
     """
     now = datetime.datetime.utcnow()
-    dt_end = order.get("close_dt") or now
-    dtype = (order.get("delivery_type") or "").lower()
-    if dtype == "planned order":
-        dt_start = order.get("accept_dt") or order.get("order_date")
-    else:
-        dt_start = order.get("order_date")
+
+    dtype = (order.get("delivery_type") or "").lower().strip()
+    if dtype != "express":
+        # planned order / others
+        return "Non applicable : End-to-End express est disponible uniquement pour les commandes EXPRESS."
+
+    dt_start = order.get("order_date")
     if not dt_start:
-        return "Impossible à calculer (date de départ manquante)."
+        return "Impossible à calculer (Order Date manquante)."
+
+    dt_end = order.get("close_dt") or now
     td = dt_end - dt_start
-    delivered = "✅ Livrée" if order.get("close_dt") else "⏳ Pas encore livrée"
-    return f"{delivered} • { _fmt_duration(td) } (de {_fmt_dt(dt_start)} à {_fmt_dt(order.get('close_dt') or now)})"
+
+    delivered = "Livrée" if order.get("close_dt") else "En cours"
+    return f"{delivered} • {_fmt_duration(td)} (de {_fmt_dt(dt_start)} à {_fmt_dt(order.get('close_dt') or now)})"
 
 def compute_payment(order: Dict) -> str:
     init_amt = order.get("initial_amount")
@@ -571,9 +583,9 @@ def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float,
 # ============================
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton("🆕 Nouveau trajet", callback_data="NEW")],
-        [InlineKeyboardButton("📦 Commande", callback_data="CMD_MENU")],
-        [InlineKeyboardButton("🔄 Actualisation", callback_data="REFRESH")],
+        [InlineKeyboardButton("Nouveau trajet", callback_data="NEW")],
+        [InlineKeyboardButton("Commande", callback_data="CMD_MENU")],
+        [InlineKeyboardButton("Actualisation", callback_data="REFRESH")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -634,7 +646,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
         kb = chunk_buttons(buttons, per_row=2)
-        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+        kb.append([InlineKeyboardButton("Menu", callback_data="BACK_MENU")])
 
         await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
         return CHOOSE_STORE
@@ -649,10 +661,10 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 def commande_menu_kb() -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton("⏱ End to End", callback_data="CMD::E2E")],
-        [InlineKeyboardButton("💳 Paiement", callback_data="CMD::PAY")],
-        [InlineKeyboardButton("📌 Statut", callback_data="CMD::STATUS")],
-        [InlineKeyboardButton("⬅️ Menu", callback_data="CMD::BACK")],
+        [InlineKeyboardButton("End to End express", callback_data="CMD::E2E")],
+        [InlineKeyboardButton("Paiement", callback_data="CMD::PAY")],
+        [InlineKeyboardButton("Statut", callback_data="CMD::STATUS")],
+        [InlineKeyboardButton("Menu", callback_data="CMD::BACK")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -668,7 +680,7 @@ async def on_cmd_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # store chosen mode
     if q.data == "CMD::E2E":
         context.user_data["cmd_mode"] = "E2E"
-        await q.edit_message_text("✍️ Envoie le numéro de commande pour calculer End-to-End.")
+        await q.edit_message_text("✍️ Envoie le numéro de commande (EXPRESS) pour calculer End-to-End express.")
         context.user_data["awaiting_order_number"] = True
         return ORDER_INPUT
 
@@ -767,8 +779,8 @@ async def choose_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     btns = [InlineKeyboardButton(d, callback_data=f"DATE::{d}") for d in dates]
     kb = chunk_buttons(btns, per_row=2)
-    kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
-    kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+    kb.append([InlineKeyboardButton("Retour magasins", callback_data="BACK_STORES")])
+    kb.append([InlineKeyboardButton("Menu", callback_data="BACK_MENU")])
 
     await q.edit_message_text(
         f"📍 Magasin: {store['store_name']}\n📅 Choisis la date :",
@@ -789,7 +801,7 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stores = await ensure_stores(context)
         buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
         kb = chunk_buttons(buttons, per_row=2)
-        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+        kb.append([InlineKeyboardButton("Menu", callback_data="BACK_MENU")])
         await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
         return CHOOSE_STORE
 
@@ -803,7 +815,7 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Proposer les créneaux
     btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
     kb = chunk_buttons(btns, per_row=2)
-    kb.append([InlineKeyboardButton("⬅️ Retour dates", callback_data="BACK_DATES")])
+    kb.append([InlineKeyboardButton("Retour dates", callback_data="BACK_DATES")])
 
     store_name = context.user_data.get(CTX_STORE_NAME, "")
     await q.edit_message_text(
@@ -821,7 +833,7 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stores = await ensure_stores(context)
         buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
         kb = chunk_buttons(buttons, per_row=2)
-        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+        kb.append([InlineKeyboardButton("Menu", callback_data="BACK_MENU")])
         await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
         return CHOOSE_STORE
 
@@ -832,8 +844,8 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         btns = [InlineKeyboardButton(d, callback_data=f"DATE::{d}") for d in dates]
         kb = chunk_buttons(btns, per_row=2)
-        kb.append([InlineKeyboardButton("⬅️ Retour magasins", callback_data="BACK_STORES")])
-        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+        kb.append([InlineKeyboardButton("Retour magasins", callback_data="BACK_STORES")])
+        kb.append([InlineKeyboardButton("Menu", callback_data="BACK_MENU")])
 
         await q.edit_message_text(
             f"📍 Magasin: {store_name}\n📅 Choisis la date :",
@@ -849,8 +861,8 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, 11)]
     kb = chunk_buttons(btns, per_row=5)
-    kb.append([InlineKeyboardButton("✍️ Saisir un nombre", callback_data="DRV::TEXT")])
-    kb.append([InlineKeyboardButton("⬅️ Retour créneaux", callback_data="BACK_SLOTS")])
+    kb.append([InlineKeyboardButton("Saisir un nombre", callback_data="DRV::TEXT")])
+    kb.append([InlineKeyboardButton("Retour créneaux", callback_data="BACK_SLOTS")])
 
     store_name = context.user_data.get(CTX_STORE_NAME, "")
     d = context.user_data.get(CTX_DATE, "")
@@ -875,7 +887,7 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
             kb = chunk_buttons(btns, per_row=2)
-            kb.append([InlineKeyboardButton("⬅️ Retour dates", callback_data="BACK_DATES")])
+            kb.append([InlineKeyboardButton("Retour dates", callback_data="BACK_DATES")])
 
             await q.edit_message_text(
                 f"📍 Magasin: {store_name}\n📅 Date: {d}\n🕒 Choisis le créneau :",
@@ -997,6 +1009,15 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ============================
+# Error handler
+# ============================
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Avoid "No error handlers are registered" and log stacktrace
+    log.exception("Unhandled exception in handler", exc_info=context.error)
+
+
+# ============================
 # Build Telegram Application
 # ============================
 def build_telegram_app() -> Application:
@@ -1033,6 +1054,7 @@ def build_telegram_app() -> Application:
     )
 
     application.add_handler(conv)
+    application.add_error_handler(on_error)
     return application
 
 
