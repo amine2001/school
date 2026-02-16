@@ -7,6 +7,7 @@ import logging
 import threading
 import asyncio
 import atexit
+import datetime
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
@@ -119,6 +120,19 @@ def load_stores_from_csv(path: str) -> List[Dict]:
 
 
 # ============================
+# Text cleanup (mojibake)
+# ============================
+def fix_mojibake(s: str) -> str:
+    """Fix common UTF-8/Latin-1 mojibake (e.g., SalÃ© -> Salé)."""
+    if not s:
+        return ""
+    try:
+        b = s.encode("latin1")
+        return b.decode("utf-8")
+    except Exception:
+        return s
+
+# ============================
 # Helpers: Redash fetch
 # ============================
 def _with_api_key(url: str) -> str:
@@ -197,7 +211,7 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
     rows = []
     for row in reader:
         order_id = (row.get("Order Number") or row.get("Order") or "").strip()
-        store = (row.get("Store") or "").strip()
+        store = fix_mojibake((row.get("Store") or "").strip())
 
         status = norm_text(row.get("Status"))
         delivery_type = norm_text(row.get("Delivery Type"))
@@ -600,13 +614,39 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
 
+    # --------- Refresh Redash cache ----------
     if q.data == "REFRESH":
         try:
             await ensure_redash_cache(context, force=True)
+            # keep the main menu visible
             await q.edit_message_text("✅ Actualisation effectuée.", reply_markup=main_menu_kb())
         except Exception as e:
             await q.edit_message_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
         return ConversationHandler.END
+
+    # --------- New route planning ----------
+    if q.data == "NEW":
+        await ensure_stores(context)
+        stores = context.user_data.get(CTX_STORES, [])
+        if not stores:
+            await q.edit_message_text("⚠️ Aucun magasin trouvé (stores_coords.csv).", reply_markup=main_menu_kb())
+            return ConversationHandler.END
+
+        buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
+        kb = chunk_buttons(buttons, per_row=2)
+        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="BACK_MENU")])
+
+        await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
+        return CHOOSE_STORE
+
+    # --------- Order module ----------
+    if q.data == "CMD_MENU":
+        await q.edit_message_text("📦 Module Commande — choisis une action :", reply_markup=commande_menu_kb())
+        return ORDERS_MENU
+
+    # Unknown callback from main menu -> just show menu
+    await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
+    return ConversationHandler.END
 def commande_menu_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("⏱ End to End", callback_data="CMD::E2E")],
