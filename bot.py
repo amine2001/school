@@ -46,6 +46,24 @@ REDASH_API_KEY = os.getenv("REDASH_API_KEY", "").strip()
 STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
 MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
 
+# ✅ Max livreurs autorisés par magasin (cap recommandation + choix)
+# (Tu peux ajuster cette table sans toucher au reste du code)
+MAX_DRIVERS_BY_STORE = {
+    "Hyper Borj Fes": 1,
+    "Gourmet Zaers": 2,
+    "Hyper Dar Bouazza": 2,
+    "Hyper Sidi Maarouf": 5,
+    "Hyper Temara": 2,
+    "Hyper Salé": 2,
+    "Hyper Targa": 2,
+    "Hyper Al Mazar": 4,
+    "Hyper Tanger": 2,
+    "Hyper Tetouan": 1,
+    "Hyper Agadir": 2,
+    "Hyper Beni Mellal": 1,
+}
+
+
 # ✅ Créneaux FIXES (pas de "Tous les créneaux")
 SLOTS_FIXED = [
     "10:00 - 12:00",
@@ -87,6 +105,7 @@ CTX_STORE_DEPOT = "store_depot"
 CTX_DATE = "date"
 CTX_SLOT = "slot"
 CTX_NUM_DRIVERS = "num_drivers"
+CTX_MAX_DRIVERS_ALLOWED = "max_drivers_allowed"
 
 
 # ============================
@@ -387,9 +406,11 @@ def compute_e2e(order: Dict) -> str:
     now = datetime.datetime.utcnow()
 
     dtype = (order.get("delivery_type") or "").lower().strip()
-    if dtype != "express":
-        # planned order / others
-        return "Non applicable : End-to-End express est disponible uniquement pour les commandes EXPRESS."
+
+    if dtype not in ["express", "rapide xl"]:
+        # planned order / autres
+        return "Non applicable : End-to-End express est disponible uniquement pour Express et Rapide XL"
+
 
     dt_start = order.get("order_date")
     if not dt_start:
@@ -594,6 +615,22 @@ def chunk_buttons(buttons: List[InlineKeyboardButton], per_row: int = 2) -> List
     return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
 
 
+def get_store_max_drivers(store_name: str) -> int:
+    """Return max allowed drivers for a store (fallback 10 if unknown)."""
+    if not store_name:
+        return 10
+    return int(MAX_DRIVERS_BY_STORE.get(store_name.strip(), 10))
+
+
+def compute_allowed_driver_choices(store_name: str, orders_count: int) -> int:
+    """Max drivers the user is allowed to choose for this store+slot."""
+    store_cap = get_store_max_drivers(store_name)
+    if orders_count is None:
+        orders_count = 0
+    return max(0, min(store_cap, int(orders_count)))
+
+
+
 async def ensure_redash_cache(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> List[Dict]:
     if (not force) and context.user_data.get(CTX_REDASH_CACHE):
         return context.user_data[CTX_REDASH_CACHE]
@@ -661,7 +698,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 def commande_menu_kb() -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton("End to End express", callback_data="CMD::E2E")],
+        [InlineKeyboardButton("End to End E/M", callback_data="CMD::E2E")],
         [InlineKeyboardButton("Paiement", callback_data="CMD::PAY")],
         [InlineKeyboardButton("Statut", callback_data="CMD::STATUS")],
         [InlineKeyboardButton("Menu", callback_data="CMD::BACK")],
@@ -859,15 +896,54 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slot = q.data.split("::", 1)[1]
     context.user_data[CTX_SLOT] = slot
 
-    btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, 11)]
+
+    store_name = context.user_data.get(CTX_STORE_NAME, "")
+    d = context.user_data.get(CTX_DATE, "")
+
+    # ✅ Count how many valid orders exist for this store/date/slot BEFORE asking drivers
+    try:
+        rows = await ensure_redash_cache(context, force=True)
+    except Exception as e:
+        await q.edit_message_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    orders = filter_orders(rows, store_name, slot, d)
+    total_orders = len(orders)
+
+    # ✅ Cap drivers by store policy and by number of orders
+    store_cap = get_store_max_drivers(store_name)
+    allowed_max = compute_allowed_driver_choices(store_name, total_orders)
+    context.user_data[CTX_MAX_DRIVERS_ALLOWED] = allowed_max
+
+    if total_orders <= 0:
+        kb = [
+            [InlineKeyboardButton("Retour créneaux", callback_data="BACK_SLOTS")],
+            [InlineKeyboardButton("Menu", callback_data="BACK_MENU")],
+        ]
+        await q.edit_message_text(
+            f"Magasin: {store_name}\nDate: {d}\nCréneau: {slot}\n\nAucune commande valide dans ce créneau.",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return CHOOSE_SLOT
+
+    if allowed_max <= 0:
+        kb = [
+            [InlineKeyboardButton("Retour créneaux", callback_data="BACK_SLOTS")],
+            [InlineKeyboardButton("Menu", callback_data="BACK_MENU")],
+        ]
+        await q.edit_message_text(
+            f"Magasin: {store_name}\nDate: {d}\nCréneau: {slot}\n\nCommandes: {total_orders}\nMax livreurs (magasin): {store_cap}\n\nImpossible de choisir des livreurs (cap=0).",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return CHOOSE_SLOT
+
+    btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, allowed_max + 1)]
     kb = chunk_buttons(btns, per_row=5)
     kb.append([InlineKeyboardButton("Saisir un nombre", callback_data="DRV::TEXT")])
     kb.append([InlineKeyboardButton("Retour créneaux", callback_data="BACK_SLOTS")])
 
-    store_name = context.user_data.get(CTX_STORE_NAME, "")
-    d = context.user_data.get(CTX_DATE, "")
     await q.edit_message_text(
-        f"✅ Magasin: {store_name}\n✅ Date: {d}\n✅ Créneau: {slot}\n\n🚴 Choisis le nombre de livreurs :",
+        f"Magasin: {store_name}\nDate: {d}\nCréneau: {slot}\n\nCommandes dans le créneau: {total_orders}\nMax livreurs magasin: {store_cap}\n\nChoisis le nombre de livreurs :",
         reply_markup=InlineKeyboardMarkup(kb)
     )
     return CHOOSE_DRIVERS
@@ -907,6 +983,28 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("❌ Nombre invalide.", reply_markup=main_menu_kb())
                 return ConversationHandler.END
 
+            allowed_max = int(context.user_data.get(CTX_MAX_DRIVERS_ALLOWED) or 0)
+            # If user jumps back/forward, recompute a safe cap
+            if allowed_max <= 0:
+                store_name = context.user_data.get(CTX_STORE_NAME, "")
+                try:
+                    rows = await ensure_redash_cache(context, force=True)
+                except Exception:
+                    rows = []
+                orders = filter_orders(rows, store_name, context.user_data.get(CTX_SLOT, ""), context.user_data.get(CTX_DATE, ""))
+                allowed_max = compute_allowed_driver_choices(store_name, len(orders))
+                context.user_data[CTX_MAX_DRIVERS_ALLOWED] = allowed_max
+
+            if allowed_max > 0 and n > allowed_max:
+                await q.edit_message_text(
+                    f"❌ Trop de livreurs. Max autorisé ici: {allowed_max}.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Retour", callback_data="BACK_SLOTS")],
+                        [InlineKeyboardButton("Menu", callback_data="BACK_MENU")],
+                    ])
+                )
+                return CHOOSE_SLOT
+
             context.user_data[CTX_NUM_DRIVERS] = n
             return await run_planning_and_send(update, context, edit_from_query=True)
 
@@ -921,6 +1019,22 @@ async def drivers_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         n = int(update.message.text.strip())
         if n < 1 or n > 50:
             raise ValueError
+
+        allowed_max = int(context.user_data.get(CTX_MAX_DRIVERS_ALLOWED) or 0)
+        if allowed_max <= 0:
+            store_name = context.user_data.get(CTX_STORE_NAME, "")
+            try:
+                rows = await ensure_redash_cache(context, force=True)
+            except Exception:
+                rows = []
+            orders = filter_orders(rows, store_name, context.user_data.get(CTX_SLOT, ""), context.user_data.get(CTX_DATE, ""))
+            allowed_max = compute_allowed_driver_choices(store_name, len(orders))
+            context.user_data[CTX_MAX_DRIVERS_ALLOWED] = allowed_max
+
+        if allowed_max > 0 and n > allowed_max:
+            await update.message.reply_text(f"❌ Trop de livreurs. Max autorisé ici: {allowed_max}.")
+            return
+
     except Exception:
         await update.message.reply_text("❌ Nombre invalide. Envoie un entier entre 1 et 50.")
         return
@@ -956,6 +1070,15 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     orders = filter_orders(rows, store_name, slot, day_of_delivery)
+
+    # ✅ Safety cap: never allow more drivers than store policy or number of orders
+    store_cap = get_store_max_drivers(store_name)
+    allowed_max = compute_allowed_driver_choices(store_name, len(orders))
+    context.user_data[CTX_MAX_DRIVERS_ALLOWED] = allowed_max
+    if allowed_max > 0 and num_drivers > allowed_max:
+        num_drivers = allowed_max
+        context.user_data[CTX_NUM_DRIVERS] = num_drivers
+
     if not orders:
         msg = (
             f"⚠️ Aucune commande valide trouvée.\n"
