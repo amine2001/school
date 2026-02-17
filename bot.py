@@ -518,10 +518,9 @@ def build_distance_matrix(points: List[Tuple[float, float]]) -> List[List[int]]:
 def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]], num_vehicles: int) -> List[List[int]]:
     """
     VRP tuned to:
-      - always return a solution when feasible
-      - strongly discourage dropping orders
-      - avoid "0 routes" when the solver fails by relaxing hard balancing
-      - keep optimization high (GUIDED_LOCAL_SEARCH) and reduce zig-zag by minimizing distance + span
+      - NEVER return "0 orders for everyone" (huge drop penalty)
+      - Use all vehicles when possible (hard constraint: each vehicle >= 1 order if K <= N)
+      - Keep optimization strong (GUIDED_LOCAL_SEARCH) and reduce zig-zag by distance minimization + balancing span
     Returns: list of routes as node indices (1..N) for each vehicle.
     """
     if num_vehicles <= 0:
@@ -542,21 +541,12 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
     transit_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
 
-    # ---- Strongly discourage unused vehicles (but allow if user picked too many) ----
-    fixed_vehicle_cost = 15000
-    for v in range(num_vehicles):
-        routing.SetFixedCostOfVehicle(fixed_vehicle_cost, v)
-
-    # ---- Make orders droppable with a HUGE penalty (so solver prefers serving them) ----
-    # Without this, OR-Tools can choose to serve 0 orders (distance=0).
+    # ---- Make orders droppable with a HUGE penalty (so solver serves them) ----
     drop_penalty = 10**7
     for node in range(1, len(points)):
         routing.AddDisjunction([manager.NodeToIndex(node)], drop_penalty)
 
-    # ---- Count / balancing (RELAXED): hard upper bound + soft lower bound ----
-    # Hard balancing (exact N/K) can make the solver fail for some K; we switch to:
-    #   - hard upper = ceil(N/K) (capacity)
-    #   - soft lower = floor(N/K) with penalty if a vehicle is under-used
+    # ---- Count / balancing ----
     n = len(orders)
     k = max(1, num_vehicles)
     min_load = n // k
@@ -570,30 +560,22 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
 
     routing.AddDimensionWithVehicleCapacity(
         demand_idx,
-        0,                              # slack
-        [max_load] * num_vehicles,      # hard upper bound per vehicle
+        0,
+        [max_load] * num_vehicles,
         True,
         "Count"
     )
     count_dim = routing.GetDimensionOrDie("Count")
 
-    underuse_penalty = 30000  # per missing order under min_load
-    for v in range(num_vehicles):
-        end = routing.End(v)
-        if min_load > 0:
-            count_dim.SetCumulVarSoftLowerBound(end, min_load, underuse_penalty)
-
-    # Balance loads (minimize spread)
+    # Encourage balance
     count_dim.SetGlobalSpanCostCoefficient(2000)
-    # ============================
-    # FORCE usage of all vehicles
-    # ============================
-    # Si un livreur a 0 commande -> grosse pénalité
-    empty_penalty = 120000
 
-    for v in range(num_vehicles):
-        end = routing.End(v)
-        count_dim.SetCumulVarSoftLowerBound(end, 1, empty_penalty)
+    # ---- HARD: force usage of all vehicles if possible ----
+    # If K <= N, each vehicle must take >= 1 order (no more "Livreur X: 0 commande").
+    if num_vehicles <= n:
+        solver = routing.solver()
+        for v in range(num_vehicles):
+            solver.Add(count_dim.CumulVar(routing.End(v)) >= 1)
 
     # Stabilize decisions
     for v in range(num_vehicles):
@@ -620,6 +602,7 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
             idx = solution.Value(routing.NextVar(idx))
         routes.append(stops)
     return routes
+
 
 
 
