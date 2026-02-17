@@ -478,15 +478,21 @@ def available_dates_for_store(rows: List[Dict], store_name: str) -> List[str]:
 
 def filter_orders(rows: List[Dict], store_name: str, slot: str, day_of_delivery: str) -> List[Tuple[str, float, float]]:
     out = []
+    target_store = fix_mojibake(store_name or "").strip()
+
     for r in rows:
-        if (r["store"] or "").strip() != (store_name or "").strip():
+        row_store = fix_mojibake(r.get("store") or "").strip()
+
+        if row_store != target_store:
             continue
         if (r.get("day_of_delivery") or "").strip() != (day_of_delivery or "").strip():
             continue
         if norm_slot(r["slot"]) != norm_slot(slot):
             continue
+
         out.append((r["order_id"], r["lat"], r["lon"]))
     return out
+
 
 
 # ============================
