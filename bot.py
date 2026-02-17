@@ -495,9 +495,7 @@ def filter_orders(rows: List[Dict], store_name: str, slot: str, day_of_delivery:
 
 
 
-# ============================
-# VRP utilities
-# ============================
+
 def haversine_m(lat1, lon1, lat2, lon2) -> float:
     R = 6371000.0
     p1 = math.radians(lat1)
