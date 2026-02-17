@@ -94,7 +94,7 @@ log = logging.getLogger("bringo-bot")
 # ============================
 # Telegram Conversation States
 # ============================
-(CHOOSE_STORE, CHOOSE_DATE, CHOOSE_SLOT, CHOOSE_DRIVERS, ORDERS_MENU, ORDER_INPUT, STORE_MENU) = range(7)
+(CHOOSE_STORE, CHOOSE_DATE, CHOOSE_SLOT, CHOOSE_DRIVERS, ORDERS_MENU, ORDER_INPUT) = range(6)
 
 # context keys
 CTX_STORES = "stores"
@@ -364,13 +364,6 @@ def parse_redash_rows_all(csv_text: str) -> List[Dict]:
             "close_dt": close_dt,
             "etat_picker": norm_text(row.get("Etat Picker")),
             "etat_shopper": norm_text(row.get("Etat Shopper")),
-            "last_mile_status": norm_text(
-                row.get("Status Lastmile")
-                or row.get("Statut last mile")
-                or row.get("Statut Last Mile")
-                or row.get("Last Mile Status")
-                or row.get("Last mile status")
-            ),
             "raw": row,
         })
     return out
@@ -443,175 +436,36 @@ def compute_payment(order: Dict) -> str:
         return f"✅ Payé (Total payé: {paid} / Montant: {init_amt})"
     return f"❌ Non payé (Total payé: {paid} / Montant: {init_amt})"
 
-
-# ==========================
-# ✅ STATUTS (100% REDASH)
-# - Aucun calcul SLA
-# - Acceptation/Préparation/Chargement/Livraison: OK si date remplie sinon EN COURS
-# - Last Mile: basé uniquement sur "Etat Shopper" (late => RETARD, on_time/complete => OK, sinon EN COURS)
-# ==========================
-def _filled(v) -> bool:
-    s = str(v or "").strip()
-    return s not in ("", "nan", "None")
-
-def _ok_if_filled(v) -> str:
-    return "OK" if _filled(v) else "EN COURS"
-
-def _status_acceptation(order: Dict) -> str:
-    return _ok_if_filled((order.get("raw") or {}).get("Date d'acceptation prep"))
-
-def _status_preparation(order: Dict) -> str:
-    return _ok_if_filled((order.get("raw") or {}).get("Order Preparation End"))
-
-def _status_chargement(order: Dict) -> str:
-    return _ok_if_filled((order.get("raw") or {}).get("Chargement date"))
-
-def _status_livraison(order: Dict) -> str:
-    return _ok_if_filled((order.get("raw") or {}).get("Date de cloture"))
-
-def _status_lastmile(order: Dict) -> str:
-    s = ((order.get("raw") or {}).get("Etat Shopper") or "").strip().lower()
-    if "late" in s:
-        return "RETARD"
-    if ("on_time" in s) or ("ontime" in s) or ("complete" in s):
-        return "OK"
-    return "EN COURS"
-
-
 def compute_step_status(order: Dict) -> List[str]:
-    """
-    Statut détaillé basé UNIQUEMENT sur Redash.
-    - Aucun calcul SLA côté bot.
-    - Acceptation/Préparation/Chargement/Livraison: OK si la date Redash est remplie, sinon EN COURS.
-    - Last Mile: basé uniquement sur 'Etat Shopper' (late => RETARD, on_time/complete => OK, sinon EN COURS).
-    """
+    """Return lines for Acceptance/Preparation/Chargement/Livraison with retard logic."""
+    now = datetime.datetime.utcnow()
+    order_date = order.get("order_date")
+    accept_dt = order.get("accept_dt")
+    prep_end = order.get("prep_end_dt")
+    load_dt = order.get("load_dt")
+    close_dt = order.get("close_dt")
 
-    def line_ok_encours(label: str, status: str, dt_key: str):
-        if status == "OK":
-            dt = order.get(dt_key)
-            return f"✅ {label}: OK" + (f" ({_fmt_dt(dt)})" if dt else "")
-        return f"⏳ {label}: EN COURS"
+    def line(label, done_dt, ref_dt, max_min):
+        if done_dt:
+            return f"✅ {label}: OK ({_fmt_dt(done_dt)})"
+        # not done
+        if not ref_dt:
+            return f"⚠️ {label}: En attente (référence manquante)"
+        late = (now - ref_dt).total_seconds() > max_min * 60
+        if late:
+            return f"🚨 {label}: Retard (>{max_min} min)"
+        return f"⏳ {label}: En cours"
 
-    def line_lastmile(status: str):
-        if status == "RETARD":
-            return "🚨 Last Mile: RETARD"
-        if status == "OK":
-            return "✅ Last Mile: OK"
-        return "⏳ Last Mile: EN COURS"
-
-    st_accept = _status_acceptation(order)
-    st_prep   = _status_preparation(order)
-    st_load   = _status_chargement(order)
-    st_deliv  = _status_livraison(order)
-    st_lm     = _status_lastmile(order)
-
-    return [
-        line_ok_encours("Acceptation", st_accept, "accept_dt"),
-        line_ok_encours("Préparation", st_prep, "prep_end_dt"),
-        line_ok_encours("Chargement", st_load, "load_dt"),
-        line_ok_encours("Livraison", st_deliv, "close_dt"),
-        line_lastmile(st_lm),
-    ]
-
-
-def magasin_menu_kb() -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton("Hyper", callback_data="STORE::HYPER")],
-        [InlineKeyboardButton("Rapide XL", callback_data="STORE::RAPIDEXL")],
-        [InlineKeyboardButton("Express", callback_data="STORE::EXPRESS")],
-        [InlineKeyboardButton("Retour", callback_data="STORE::BACK")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-def _is_cancelled(status: str) -> bool:
-    s = (status or "").lower()
-    return ("annul" in s) or ("cancel" in s)
-
-def _is_lastmile_retard(last_mile_status: str) -> bool:
-    s = (last_mile_status or "").lower()
-    return ("retard" in s) or ("late" in s) or ("delay" in s)
-
-def _class_store_is_hyper(store_name: str) -> bool:
-    return (store_name or "").strip().lower().startswith("hyper")
-
-def _class_is_express(dtype: str) -> bool:
-    return (dtype or "").lower().strip() == "express"
-
-def _class_is_rapide_xl(dtype: str) -> bool:
-    return (dtype or "").lower().strip() == "rapide xl"
-
-def _to_money(x) -> float:
-    try:
-        if isinstance(x, (int, float)):
-            return float(x)
-        return 0.0
-    except Exception:
-        return 0.0
-
-def build_magasin_summary(rows_all: List[Dict], mode: str) -> str:
-    """
-    Summary magasin (global) basé UNIQUEMENT sur Redash (aucun calcul SLA côté bot).
-
-    - Nombre de commande
-    - Nombre de commande retard (Last Mile = Etat Shopper contient 'late')
-    - Nombre annulé
-    - Totaux retard par étape (ici = commandes EN COURS par étape, car Redash ne fournit pas un champ 'late' par étape)
-    - CA (Total Amount Paid)
-    - CA perdu (Initial - Paid)
-    """
-
-    def keep(o: Dict) -> bool:
-        if mode == "HYPER":
-            return _class_store_is_hyper(o.get("store"))
-        if mode == "RAPIDEXL":
-            return _class_is_rapide_xl(o.get("delivery_type"))
-        if mode == "EXPRESS":
-            return _class_is_express(o.get("delivery_type"))
-        return False
-
-    items = [o for o in rows_all if keep(o)]
-    title = {"HYPER": "🏬 Hyper", "RAPIDEXL": "🚚 Rapide XL", "EXPRESS": "⚡ Express"}.get(mode, mode)
-
-    if not items:
-        return f"{title}\n\n⚠️ Aucune donnée."
-
-    total_cmd = len(items)
-    retard_cmd = sum(1 for o in items if _status_lastmile(o) == "RETARD")
-    cancel_cmd = sum(1 for o in items if _is_cancelled(o.get("status")))
-
-    # "Totaux retard par étape" (sans SLA): on compte les commandes EN COURS à chaque étape
-    accept_pending = sum(1 for o in items if _status_acceptation(o) == "EN COURS")
-    prep_pending   = sum(1 for o in items if _status_preparation(o) == "EN COURS")
-    load_pending   = sum(1 for o in items if _status_chargement(o) == "EN COURS")
-    deliv_pending  = sum(1 for o in items if _status_livraison(o) == "EN COURS")
-
-    ca = 0.0
-    ca_perdu = 0.0
-    for o in items:
-        ca += _to_money(o.get("total_paid"))
-        init_amt = _to_money(o.get("initial_amount"))
-        paid = _to_money(o.get("total_paid"))
-        ca_perdu += (init_amt - paid)
-
-    lines = [
-        f"{title}",
-        "",
-        f"📦 Nombre de commande: {total_cmd}",
-        f"🚨 Nombre de commande retard (Last Mile): {retard_cmd}",
-        f"❌ Nombre de commande annuler: {cancel_cmd}",
-        "",
-        "📌 Totaux retard par étape (EN COURS):",
-        f"🧾 Acceptation: {accept_pending}",
-        f"🍳 Préparation: {prep_pending}",
-        f"📦 Chargement: {load_pending}",
-        f"🏁 Livraison: {deliv_pending}",
-        "",
-        f"💰 Chiffre d'affaire: {ca:.2f}",
-        f"💸 Chiffre d'affire perdu: {ca_perdu:.2f}",
-    ]
-    return "\n".join(lines)
-
-
+    # Acceptance reference: order_date
+    lines = []
+    lines.append(line("Acceptation", accept_dt, order_date, ACCEPT_MAX_MIN))
+    # Preparation reference: accept_dt
+    lines.append(line("Préparation", prep_end, accept_dt or order_date, PREP_MAX_MIN))
+    # Chargement reference: prep_end
+    lines.append(line("Chargement", load_dt, prep_end or accept_dt or order_date, LOAD_MAX_MIN))
+    # Livraison reference: load_dt
+    lines.append(line("Livraison", close_dt, load_dt or prep_end or accept_dt or order_date, DELIV_MAX_MIN))
+    return lines
 def available_dates_for_store(rows: List[Dict], store_name: str) -> List[str]:
     dates = sorted({
         (r.get("day_of_delivery") or "").strip()
@@ -773,7 +627,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("Nouveau trajet", callback_data="NEW")],
         [InlineKeyboardButton("Commande", callback_data="CMD_MENU")],
-        [InlineKeyboardButton("Magasin", callback_data="STORE_MENU")],
         [InlineKeyboardButton("Actualisation", callback_data="REFRESH")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -861,17 +714,12 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📦 Module Commande — choisis une action :", reply_markup=commande_menu_kb())
         return ORDERS_MENU
 
-    # --------- Magasin module ----------
-    if q.data == "STORE_MENU":
-        await q.edit_message_text("🏬 Magasin — choisis une catégorie :", reply_markup=magasin_menu_kb())
-        return STORE_MENU
-
     # Unknown callback from main menu -> just show menu
     await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
     return ConversationHandler.END
 def commande_menu_kb() -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton("End to End express", callback_data="CMD::E2E")],
+        [InlineKeyboardButton("End to End E/M", callback_data="CMD::E2E")],
         [InlineKeyboardButton("Paiement", callback_data="CMD::PAY")],
         [InlineKeyboardButton("Statut", callback_data="CMD::STATUS")],
         [InlineKeyboardButton("Menu", callback_data="CMD::BACK")],
@@ -924,76 +772,6 @@ async def order_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
         context.user_data["awaiting_order_number"] = False
         return ConversationHandler.END
-
-    # Find order
-    order = None
-    for o in rows_all:
-        if str(o.get("order_id") or "").strip() == order_no:
-            order = o
-            break
-
-    if not order:
-        await update.message.reply_text("⚠️ Commande introuvable dans Redash.", reply_markup=main_menu_kb())
-        context.user_data["awaiting_order_number"] = False
-        return ConversationHandler.END
-
-    mode = context.user_data.get("cmd_mode") or "STATUS"
-
-    # Common header
-    header = [
-        f"📦 Commande {order.get('order_id')}",
-        f"🏬 {order.get('store') or '-'}",
-        f"📅 Day Of Delivery: {order.get('day_of_delivery') or '-'}",
-        ""
-    ]
-
-    if mode == "E2E":
-        body = [f"⏱ End-to-End express: {compute_e2e(order)}"]
-    elif mode == "PAY":
-        body = [f"💳 Paiement: {compute_payment(order)}"]
-    else:  # STATUS
-        body = ["📌 Statut détaillé:"] + compute_step_status(order)
-
-    msg = "\n".join(header + body)
-
-    await update.message.reply_text(msg, reply_markup=main_menu_kb(), disable_web_page_preview=True)
-
-    context.user_data["awaiting_order_number"] = False
-    return ConversationHandler.END
-async def on_store_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await safe_answer(q)
-
-    if q.data == "STORE::BACK":
-        await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-
-    if q.data == "STORE_MENU":
-        await q.edit_message_text("🏬 Magasin — choisis une catégorie :", reply_markup=magasin_menu_kb())
-        return STORE_MENU
-
-    if not q.data.startswith("STORE::"):
-        return STORE_MENU
-
-    mode = q.data.split("::", 1)[1].strip().upper()
-    if mode not in ("HYPER", "RAPIDEXL", "EXPRESS"):
-        return STORE_MENU
-
-    try:
-        rows_all = await ensure_redash_all_cache(context, force=True)
-    except Exception as e:
-        await q.edit_message_text(f"❌ Impossible de récupérer Redash: {e}", reply_markup=main_menu_kb())
-        return ConversationHandler.END
-
-    report = build_magasin_summary(rows_all, mode)
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Retour", callback_data="STORE_MENU")],
-        [InlineKeyboardButton("Menu", callback_data="STORE::BACK")],
-    ])
-
-    await q.edit_message_text(report, reply_markup=kb, disable_web_page_preview=True)
-    return STORE_MENU
 
     order = find_order(rows_all, order_no)
     if not order:
@@ -1392,7 +1170,7 @@ def build_telegram_app() -> Application:
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_cmd),
-            CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH|CMD_MENU|STORE_MENU)$"),
+            CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH|CMD_MENU)$"),
         ],
         states={
             CHOOSE_STORE: [
@@ -1413,10 +1191,6 @@ def build_telegram_app() -> Application:
             ],
             ORDER_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, order_input_text),
-            ],
-            STORE_MENU: [
-                CallbackQueryHandler(on_menu_click, pattern="^STORE_MENU$"),
-                CallbackQueryHandler(on_store_menu_click, pattern="^(STORE::|STORE_MENU).*$"),
             ],
         },
         fallbacks=[CommandHandler("start", start_cmd)],
