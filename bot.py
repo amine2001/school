@@ -903,7 +903,41 @@ async def order_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_order_number"] = False
         return ConversationHandler.END
 
+    # Find order
+    order = None
+    for o in rows_all:
+        if str(o.get("order_id") or "").strip() == order_no:
+            order = o
+            break
 
+    if not order:
+        await update.message.reply_text("⚠️ Commande introuvable dans Redash.", reply_markup=main_menu_kb())
+        context.user_data["awaiting_order_number"] = False
+        return ConversationHandler.END
+
+    mode = context.user_data.get("cmd_mode") or "STATUS"
+
+    # Common header
+    header = [
+        f"📦 Commande {order.get('order_id')}",
+        f"🏬 {order.get('store') or '-'}",
+        f"📅 Day Of Delivery: {order.get('day_of_delivery') or '-'}",
+        ""
+    ]
+
+    if mode == "E2E":
+        body = [f"⏱ End-to-End express: {compute_e2e(order)}"]
+    elif mode == "PAY":
+        body = [f"💳 Paiement: {compute_payment(order)}"]
+    else:  # STATUS
+        body = ["📌 Statut détaillé:"] + compute_step_status(order)
+
+    msg = "\n".join(header + body)
+
+    await update.message.reply_text(msg, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+
+    context.user_data["awaiting_order_number"] = False
+    return ConversationHandler.END
 async def on_store_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
