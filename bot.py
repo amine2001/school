@@ -516,12 +516,24 @@ def build_distance_matrix(points: List[Tuple[float, float]]) -> List[List[int]]:
 
 
 def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]], num_vehicles: int) -> List[List[int]]:
+    """
+    VRP tuned to:
+      - always return a solution when feasible
+      - strongly discourage dropping orders
+      - avoid "0 routes" when the solver fails by relaxing hard balancing
+      - keep optimization high (GUIDED_LOCAL_SEARCH) and reduce zig-zag by minimizing distance + span
+    Returns: list of routes as node indices (1..N) for each vehicle.
+    """
+    if num_vehicles <= 0:
+        return []
+
     points = [depot] + [(lat, lon) for (_, lat, lon) in orders]
     dist = build_distance_matrix(points)
 
     manager = pywrapcp.RoutingIndexManager(len(points), num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
 
+    # ---- Distance cost ----
     def dist_cb(from_index, to_index):
         i = manager.IndexToNode(from_index)
         j = manager.IndexToNode(to_index)
@@ -530,43 +542,59 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
     transit_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
 
-    # ✅ Balance des commandes (N/K)
-    def count_cb(from_index, to_index):
-        node = manager.IndexToNode(to_index)
-        return 0 if node == 0 else 1
+    # ---- Strongly discourage unused vehicles (but allow if user picked too many) ----
+    fixed_vehicle_cost = 15000
+    for v in range(num_vehicles):
+        routing.SetFixedCostOfVehicle(fixed_vehicle_cost, v)
 
-    count_idx = routing.RegisterTransitCallback(count_cb)
+    # ---- Make orders droppable with a HUGE penalty (so solver prefers serving them) ----
+    # Without this, OR-Tools can choose to serve 0 orders (distance=0).
+    drop_penalty = 10**7
+    for node in range(1, len(points)):
+        routing.AddDisjunction([manager.NodeToIndex(node)], drop_penalty)
 
-    routing.AddDimension(
-        count_idx,
-        0,
-        len(orders),
-        True,
-        "Count"
-    )
-
-    count_dim = routing.GetDimensionOrDie("Count")
-    count_dim.SetGlobalSpanCostCoefficient(1000)
-
-    # 🔥 HARD BALANCING N/K (chaque livreur doit avoir ~ N/K commandes)
+    # ---- Count / balancing (RELAXED): hard upper bound + soft lower bound ----
+    # Hard balancing (exact N/K) can make the solver fail for some K; we switch to:
+    #   - hard upper = ceil(N/K) (capacity)
+    #   - soft lower = floor(N/K) with penalty if a vehicle is under-used
     n = len(orders)
     k = max(1, num_vehicles)
     min_load = n // k
-    max_load = math.ceil(n / k)
+    max_load = int(math.ceil(n / k))
 
+    def demand_cb(from_index):
+        node = manager.IndexToNode(from_index)
+        return 0 if node == 0 else 1
+
+    demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
+
+    routing.AddDimensionWithVehicleCapacity(
+        demand_idx,
+        0,                              # slack
+        [max_load] * num_vehicles,      # hard upper bound per vehicle
+        True,
+        "Count"
+    )
+    count_dim = routing.GetDimensionOrDie("Count")
+
+    underuse_penalty = 30000  # per missing order under min_load
     for v in range(num_vehicles):
         end = routing.End(v)
-        count_dim.CumulVar(end).SetRange(min_load, max_load)
+        if min_load > 0:
+            count_dim.SetCumulVarSoftLowerBound(end, min_load, underuse_penalty)
 
-    # 👉 IMPORTANT: rendre les commandes "optionnelles" avec pénalité
-    penalty = 10**7
-    for node in range(1, len(points)):
-        routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
+    # Balance loads (minimize spread)
+    count_dim.SetGlobalSpanCostCoefficient(2000)
 
+    # Stabilize decisions
+    for v in range(num_vehicles):
+        routing.AddVariableMinimizedByFinalizer(count_dim.CumulVar(routing.End(v)))
+
+    # ---- Search parameters ----
     params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.AUTOMATIC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(10)
+    params.time_limit.FromSeconds(12)
 
     solution = routing.SolveWithParameters(params)
     if not solution:
@@ -583,6 +611,7 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
             idx = solution.Value(routing.NextVar(idx))
         routes.append(stops)
     return routes
+
 
 
 def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float, float]]) -> str:
