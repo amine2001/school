@@ -585,6 +585,15 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
 
     # Balance loads (minimize spread)
     count_dim.SetGlobalSpanCostCoefficient(2000)
+    # ============================
+    # FORCE usage of all vehicles
+    # ============================
+    # Si un livreur a 0 commande -> grosse pénalité
+    empty_penalty = 120000
+
+    for v in range(num_vehicles):
+        end = routing.End(v)
+        count_dim.SetCumulVarSoftLowerBound(end, 1, empty_penalty)
 
     # Stabilize decisions
     for v in range(num_vehicles):
