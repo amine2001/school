@@ -443,41 +443,77 @@ def compute_payment(order: Dict) -> str:
         return f"✅ Payé (Total payé: {paid} / Montant: {init_amt})"
     return f"❌ Non payé (Total payé: {paid} / Montant: {init_amt})"
 
+
+# ==========================
+# ✅ STATUTS (100% REDASH)
+# - Aucun calcul SLA
+# - Acceptation/Préparation/Chargement/Livraison: OK si date remplie sinon EN COURS
+# - Last Mile: basé uniquement sur "Etat Shopper" (late => RETARD, on_time/complete => OK, sinon EN COURS)
+# ==========================
+def _filled(v) -> bool:
+    s = str(v or "").strip()
+    return s not in ("", "nan", "None")
+
+def _ok_if_filled(v) -> str:
+    return "OK" if _filled(v) else "EN COURS"
+
+def _status_acceptation(order: Dict) -> str:
+    return _ok_if_filled((order.get("raw") or {}).get("Date d'acceptation prep"))
+
+def _status_preparation(order: Dict) -> str:
+    return _ok_if_filled((order.get("raw") or {}).get("Order Preparation End"))
+
+def _status_chargement(order: Dict) -> str:
+    return _ok_if_filled((order.get("raw") or {}).get("Chargement date"))
+
+def _status_livraison(order: Dict) -> str:
+    return _ok_if_filled((order.get("raw") or {}).get("Date de cloture"))
+
+def _status_lastmile(order: Dict) -> str:
+    s = ((order.get("raw") or {}).get("Etat Shopper") or "").strip().lower()
+    if "late" in s:
+        return "RETARD"
+    if ("on_time" in s) or ("ontime" in s) or ("complete" in s):
+        return "OK"
+    return "EN COURS"
+
+
 def compute_step_status(order: Dict) -> List[str]:
     """
-    Statut détaillé basé sur Redash:
-      - OK si la date existe
-      - En cours si la date est vide
-      - Retard si "Status Lastmile" indique retard/late/delay (même si la date est vide)
+    Statut détaillé basé UNIQUEMENT sur Redash.
+    - Aucun calcul SLA côté bot.
+    - Acceptation/Préparation/Chargement/Livraison: OK si la date Redash est remplie, sinon EN COURS.
+    - Last Mile: basé uniquement sur 'Etat Shopper' (late => RETARD, on_time/complete => OK, sinon EN COURS).
     """
-    lm = (order.get("last_mile_status") or "").lower()
 
-    def is_retard():
-        return ("retard" in lm) or ("late" in lm) or ("delay" in lm)
-
-    def line(label, done_dt):
-        if done_dt:
-            return f"✅ {label}: OK ({_fmt_dt(done_dt)})"
-        if is_retard():
-            return f"🚨 {label}: RETARD"
+    def line_ok_encours(label: str, status: str, dt_key: str):
+        if status == "OK":
+            dt = order.get(dt_key)
+            return f"✅ {label}: OK" + (f" ({_fmt_dt(dt)})" if dt else "")
         return f"⏳ {label}: EN COURS"
 
-    accept_dt = order.get("accept_dt")
-    prep_end = order.get("prep_end_dt")
-    load_dt = order.get("load_dt")
-    close_dt = order.get("close_dt")
+    def line_lastmile(status: str):
+        if status == "RETARD":
+            return "🚨 Last Mile: RETARD"
+        if status == "OK":
+            return "✅ Last Mile: OK"
+        return "⏳ Last Mile: EN COURS"
+
+    st_accept = _status_acceptation(order)
+    st_prep   = _status_preparation(order)
+    st_load   = _status_chargement(order)
+    st_deliv  = _status_livraison(order)
+    st_lm     = _status_lastmile(order)
 
     return [
-        line("Acceptation", accept_dt),
-        line("Préparation", prep_end),
-        line("Chargement", load_dt),
-        line("Livraison", close_dt),
+        line_ok_encours("Acceptation", st_accept, "accept_dt"),
+        line_ok_encours("Préparation", st_prep, "prep_end_dt"),
+        line_ok_encours("Chargement", st_load, "load_dt"),
+        line_ok_encours("Livraison", st_deliv, "close_dt"),
+        line_lastmile(st_lm),
     ]
 
 
-# ============================
-# Magasin (dashboards)
-# ============================
 def magasin_menu_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("Hyper", callback_data="STORE::HYPER")],
@@ -514,13 +550,15 @@ def _to_money(x) -> float:
 
 def build_magasin_summary(rows_all: List[Dict], mode: str) -> str:
     """
-    mode:
-      HYPER      -> stores starting with 'Hyper'
-      RAPIDEXL   -> delivery_type == 'rapide xl'
-      EXPRESS    -> delivery_type == 'express'
-    Summary (global, not per store), with emojis.
+    Summary magasin (global) basé UNIQUEMENT sur Redash (aucun calcul SLA côté bot).
+
+    - Nombre de commande
+    - Nombre de commande retard (Last Mile = Etat Shopper contient 'late')
+    - Nombre annulé
+    - Totaux retard par étape (ici = commandes EN COURS par étape, car Redash ne fournit pas un champ 'late' par étape)
+    - CA (Total Amount Paid)
+    - CA perdu (Initial - Paid)
     """
-    now = datetime.datetime.utcnow()
 
     def keep(o: Dict) -> bool:
         if mode == "HYPER":
@@ -532,64 +570,48 @@ def build_magasin_summary(rows_all: List[Dict], mode: str) -> str:
         return False
 
     items = [o for o in rows_all if keep(o)]
-    title = {"HYPER":"🏬 Hyper", "RAPIDEXL":"🚚 Rapide XL", "EXPRESS":"⚡ Express"}.get(mode, mode)
+    title = {"HYPER": "🏬 Hyper", "RAPIDEXL": "🚚 Rapide XL", "EXPRESS": "⚡ Express"}.get(mode, mode)
 
     if not items:
         return f"{title}\n\n⚠️ Aucune donnée."
 
     total_cmd = len(items)
-    retard_cmd = sum(1 for o in items if _is_lastmile_retard(o.get("last_mile_status")))
+    retard_cmd = sum(1 for o in items if _status_lastmile(o) == "RETARD")
     cancel_cmd = sum(1 for o in items if _is_cancelled(o.get("status")))
 
-    # SLA totals (counts of orders currently late at that stage)
-    accept_late = prep_late = load_late = deliv_late = 0
+    # "Totaux retard par étape" (sans SLA): on compte les commandes EN COURS à chaque étape
+    accept_pending = sum(1 for o in items if _status_acceptation(o) == "EN COURS")
+    prep_pending   = sum(1 for o in items if _status_preparation(o) == "EN COURS")
+    load_pending   = sum(1 for o in items if _status_chargement(o) == "EN COURS")
+    deliv_pending  = sum(1 for o in items if _status_livraison(o) == "EN COURS")
+
     ca = 0.0
     ca_perdu = 0.0
-
     for o in items:
         ca += _to_money(o.get("total_paid"))
         init_amt = _to_money(o.get("initial_amount"))
         paid = _to_money(o.get("total_paid"))
         ca_perdu += (init_amt - paid)
 
-        order_date = o.get("order_date")
-        accept_dt = o.get("accept_dt")
-        prep_end = o.get("prep_end_dt")
-        load_dt = o.get("load_dt")
-        close_dt = o.get("close_dt")
-
-        def is_late(done_dt, ref_dt, max_min):
-            if done_dt:
-                return False
-            if not ref_dt:
-                return False
-            return (now - ref_dt).total_seconds() > max_min * 60
-
-        if is_late(accept_dt, order_date, ACCEPT_MAX_MIN):
-            accept_late += 1
-        if is_late(prep_end, accept_dt or order_date, PREP_MAX_MIN):
-            prep_late += 1
-        if is_late(load_dt, prep_end or accept_dt or order_date, LOAD_MAX_MIN):
-            load_late += 1
-        if is_late(close_dt, load_dt or prep_end or accept_dt or order_date, DELIV_MAX_MIN):
-            deliv_late += 1
-
     lines = [
         f"{title}",
         "",
         f"📦 Nombre de commande: {total_cmd}",
-        f"🚨 Nombre de commande retard: {retard_cmd}",
+        f"🚨 Nombre de commande retard (Last Mile): {retard_cmd}",
         f"❌ Nombre de commande annuler: {cancel_cmd}",
         "",
-        f"⏱ Totale retard acceptation: {accept_late}",
-        f"🍳 Totale retard preparation: {prep_late}",
-        f"📦 Totale retard chargement: {load_late}",
-        f"🏁 Totale retard livraison: {deliv_late}",
+        "📌 Totaux retard par étape (EN COURS):",
+        f"🧾 Acceptation: {accept_pending}",
+        f"🍳 Préparation: {prep_pending}",
+        f"📦 Chargement: {load_pending}",
+        f"🏁 Livraison: {deliv_pending}",
         "",
         f"💰 Chiffre d'affaire: {ca:.2f}",
         f"💸 Chiffre d'affire perdu: {ca_perdu:.2f}",
     ]
     return "\n".join(lines)
+
+
 def available_dates_for_store(rows: List[Dict], store_name: str) -> List[str]:
     dates = sorted({
         (r.get("day_of_delivery") or "").strip()
