@@ -1,5 +1,10 @@
 python-telegram-bot==21.6
-Flask==3.0.3
-requests
-ortools
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+pandas
+openpyxl
+Flask
 gunicorn
+requests
