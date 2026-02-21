@@ -71,7 +71,7 @@ SLOTS_FIXED = [
     "12:00 - 14:00",
     "14:00 - 16:00",
     "16:00 - 18:00",
-    "20:00 - 22:00",
+    "20:00 - 22:30",
     "20:30 - 22:30"
 ]
 
@@ -1586,5 +1586,6 @@ atexit.register(_on_exit)
 if __name__ == "__main__":
     start_background_bot(wait_ready=True)
     print("Local: gunicorn bot:flask_app --bind 0.0.0.0:10000 --workers 1 --threads 8")
+
 
 
