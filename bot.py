@@ -58,9 +58,9 @@ MAX_DRIVERS_BY_STORE = {
     "Hyper Salé": 2,
     "Hyper Targa": 2,
     "Hyper Al Mazar": 4,
-    "Hyper Tanger": 2,
+    "Hyper Tanger": 3,
     "Hyper Tetouan": 1,
-    "Hyper Agadir": 2,
+    "Hyper Agadir": 3,
     "Hyper Beni Mellal": 1,
 }
 
@@ -1586,6 +1586,7 @@ atexit.register(_on_exit)
 if __name__ == "__main__":
     start_background_bot(wait_ready=True)
     print("Local: gunicorn bot:flask_app --bind 0.0.0.0:10000 --workers 1 --threads 8")
+
 
 
 
