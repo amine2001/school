@@ -57,7 +57,7 @@ MAX_DRIVERS_BY_STORE = {
     "Hyper Temara": 3,
     "Hyper Salé": 2,
     "Hyper Targa": 2,
-    "Hyper Al Mazar": 4,
+    "Hyper Al Mazar": 5,
     "Hyper Tanger": 3,
     "Hyper Tetouan": 1,
     "Hyper Agadir": 3,
