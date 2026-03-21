@@ -50,18 +50,18 @@ MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
 # ✅ Max livreurs autorisés par magasin (cap recommandation + choix)
 # (Tu peux ajuster cette table sans toucher au reste du code)
 MAX_DRIVERS_BY_STORE = {
-    "Hyper Borj Fes": 1,
-    "Gourmet Zaers": 2,
-    "Hyper Dar Bouazza": 2,
+    "Hyper Borj Fes": 5,
+    "Gourmet Zaers": 5,
+    "Hyper Dar Bouazza": 5,
     "Hyper Sidi Maarouf": 6,
-    "Hyper Temara": 3,
-    "Hyper Salé": 2,
-    "Hyper Targa": 2,
+    "Hyper Temara": 5,
+    "Hyper Salé": 5,
+    "Hyper Targa": 5,
     "Hyper Al Mazar": 5,
-    "Hyper Tanger": 3,
-    "Hyper Tetouan": 1,
-    "Hyper Agadir": 3,
-    "Hyper Beni Mellal": 1,
+    "Hyper Tanger": 5,
+    "Hyper Tetouan": 5,
+    "Hyper Agadir": 5,
+    "Hyper Beni Mellal": 5,
 }
 
 
@@ -71,8 +71,8 @@ SLOTS_FIXED = [
     "12:00 - 14:00",
     "14:00 - 16:00",
     "16:00 - 18:00",
-    "20:00 - 22:30",
-    "20:30 - 22:30"
+    "18:00 - 20:00",
+    "20:00 - 22:00",
 ]
 
 # ✅ Business rules (as requested)
