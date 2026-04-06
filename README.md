@@ -64,6 +64,16 @@ When an admin sends `/settings`, the bot opens sections for:
 
 Changes made there are global and affect all bot users.
 
+Adding a store now uses a guided Telegram wizard step by step:
+
+- code
+- exact store name
+- latitude
+- longitude
+- max drivers
+- capacity
+- confirmation
+
 ## Security Note
 
 Do not commit real secrets to Git.

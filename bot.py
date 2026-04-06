@@ -163,6 +163,15 @@ CTX_MAX_DRIVERS_ALLOWED = "max_drivers_allowed"
 CTX_SETTINGS_ACTION = "settings_action"
 CTX_SETTINGS_STORE_ID = "settings_store_id"
 
+STORE_WIZARD_FIELDS = (
+    "store_id",
+    "store_name",
+    "lat",
+    "lon",
+    "max_drivers",
+    "capacity",
+)
+
 
 # ============================
 # Safe callback answer
@@ -1079,6 +1088,86 @@ def parse_store_payload(raw_text: str) -> Dict:
     }
 
 
+def store_wizard_cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Annuler l'ajout", callback_data="SET::STOREADD::CANCEL")]
+    ])
+
+
+def store_wizard_prompt(step: str, data: Optional[Dict] = None) -> str:
+    data = data or {}
+    labels = {
+        "store_id": "code magasin",
+        "store_name": "nom magasin",
+        "lat": "latitude",
+        "lon": "longitude",
+        "max_drivers": "max livreurs",
+        "capacity": "capacité",
+    }
+    step_index = STORE_WIZARD_FIELDS.index(step) + 1
+    prompts = {
+        "store_id": "Étape 1/6\nEnvoie le code magasin. Exemple: HBF",
+        "store_name": "Étape 2/6\nEnvoie le nom exact du magasin.\nIl doit correspondre au nom utilisé dans Redash.",
+        "lat": f"Étape 3/6\nEnvoie la latitude pour {data.get('store_name') or 'ce magasin'}.",
+        "lon": f"Étape 4/6\nEnvoie la longitude pour {data.get('store_name') or 'ce magasin'}.",
+        "max_drivers": f"Étape 5/6\nEnvoie le max livreurs pour {data.get('store_name') or 'ce magasin'}.",
+        "capacity": f"Étape 6/6\nEnvoie la capacité du magasin {data.get('store_name') or ''}.",
+    }
+    summary = []
+    for field in STORE_WIZARD_FIELDS:
+        if field == step:
+            break
+        if field in data:
+            summary.append(f"- {labels[field]}: {data[field]}")
+    prefix = "Assistant ajout magasin\n\n"
+    if summary:
+        prefix += "Déjà saisi:\n" + "\n".join(summary) + "\n\n"
+    return prefix + prompts.get(step, f"Étape {step_index}/6\nEnvoie la valeur.")
+
+
+def store_wizard_confirm_text(data: Dict) -> str:
+    return "\n".join([
+        "Confirme l'ajout de ce magasin :",
+        "",
+        f"Code: {data['store_id']}",
+        f"Nom: {data['store_name']}",
+        f"Latitude: {data['lat']}",
+        f"Longitude: {data['lon']}",
+        f"Max livreurs: {data['max_drivers']}",
+        f"Capacité: {data['capacity']}",
+    ])
+
+
+def store_wizard_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Confirmer", callback_data="SET::STOREADD::CONFIRM")],
+        [InlineKeyboardButton("Annuler", callback_data="SET::STOREADD::CANCEL")],
+    ])
+
+
+def parse_store_wizard_value(step: str, raw_text: str, data: Dict) -> object:
+    text = (raw_text or "").strip()
+    if step == "store_id":
+        if not text:
+            raise ValueError("Le code magasin est obligatoire.")
+        if get_store(text, active_only=False):
+            raise ValueError("Ce code magasin existe déjà.")
+        return text
+    if step == "store_name":
+        if not text:
+            raise ValueError("Le nom magasin est obligatoire.")
+        return text
+    if step == "lat":
+        return parse_float_field(text, "La latitude")
+    if step == "lon":
+        return parse_float_field(text, "La longitude")
+    if step == "max_drivers":
+        return parse_int_field(text, "Le max livreurs", minimum=0)
+    if step == "capacity":
+        return parse_int_field(text, "La capacité", minimum=0)
+    raise ValueError("Étape inconnue.")
+
+
 def build_route_plan(
     store: Dict,
     day_of_delivery: str,
@@ -1247,6 +1336,43 @@ async def settings_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return SETTINGS_MENU
 
+    if data == "SET::STOREADD::CANCEL":
+        set_settings_action(context, None)
+        await q.edit_message_text("Ajout magasin annulé.", reply_markup=settings_stores_kb())
+        return SETTINGS_MENU
+
+    if data == "SET::STOREADD::CONFIRM":
+        action = get_settings_action(context)
+        if not action or action.get("type") != "ADD_STORE_WIZARD":
+            await q.edit_message_text("Aucun ajout magasin en cours.", reply_markup=settings_stores_kb())
+            return SETTINGS_MENU
+
+        data_payload = action.get("data") or {}
+        missing = [field for field in STORE_WIZARD_FIELDS if field not in data_payload]
+        if missing:
+            await q.edit_message_text(
+                "Ajout incomplet. Reprends l'assistant depuis le menu magasins.",
+                reply_markup=settings_stores_kb(),
+            )
+            set_settings_action(context, None)
+            return SETTINGS_MENU
+
+        save_store(
+            store_id=data_payload["store_id"],
+            store_name=data_payload["store_name"],
+            lat=data_payload["lat"],
+            lon=data_payload["lon"],
+            max_drivers=data_payload["max_drivers"],
+            capacity=data_payload["capacity"],
+            is_active=True,
+        )
+        set_settings_action(context, None)
+        await q.edit_message_text(
+            "✅ Magasin ajouté.\n\n" + format_stores_list(),
+            reply_markup=settings_stores_kb(),
+        )
+        return SETTINGS_MENU
+
     if data == "SET::SEC::STORES":
         set_settings_action(context, None)
         await q.edit_message_text("🏬 Gestion des magasins", reply_markup=settings_stores_kb())
@@ -1264,11 +1390,10 @@ async def settings_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SETTINGS_MENU
 
     if data == "SET::STORES::ADD":
-        set_settings_action(context, {"type": "ADD_STORE"})
+        set_settings_action(context, {"type": "ADD_STORE_WIZARD", "step": "store_id", "data": {}})
         await q.edit_message_text(
-            "Envoie le nouveau magasin avec ce format:\n"
-            "CODE | Nom magasin | latitude | longitude | max_livreurs | capacité",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data="SET::SEC::STORES")]]),
+            store_wizard_prompt("store_id"),
+            reply_markup=store_wizard_cancel_kb(),
         )
         return SETTINGS_INPUT
 
@@ -1479,20 +1604,47 @@ async def settings_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     raw_text = (update.message.text or "").strip()
 
     try:
-        if action["type"] == "ADD_STORE":
-            payload = parse_store_payload(raw_text)
-            save_store(
-                store_id=payload["store_id"],
-                store_name=payload["store_name"],
-                lat=payload["lat"],
-                lon=payload["lon"],
-                max_drivers=payload["max_drivers"],
-                capacity=payload["capacity"],
-                is_active=True,
+        if action["type"] == "ADD_STORE_WIZARD":
+            step = action.get("step") or "store_id"
+            if step == "confirm":
+                await update.message.reply_text(
+                    "Utilise les boutons Confirmer ou Annuler.",
+                    reply_markup=store_wizard_confirm_kb(),
+                )
+                return SETTINGS_INPUT
+            data_payload = dict(action.get("data") or {})
+            data_payload[step] = parse_store_wizard_value(step, raw_text, data_payload)
+
+            current_index = STORE_WIZARD_FIELDS.index(step)
+            if current_index == len(STORE_WIZARD_FIELDS) - 1:
+                set_settings_action(
+                    context,
+                    {
+                        "type": "ADD_STORE_WIZARD",
+                        "step": "confirm",
+                        "data": data_payload,
+                    },
+                )
+                await update.message.reply_text(
+                    store_wizard_confirm_text(data_payload),
+                    reply_markup=store_wizard_confirm_kb(),
+                )
+                return SETTINGS_INPUT
+
+            next_step = STORE_WIZARD_FIELDS[current_index + 1]
+            set_settings_action(
+                context,
+                {
+                    "type": "ADD_STORE_WIZARD",
+                    "step": next_step,
+                    "data": data_payload,
+                },
             )
-            set_settings_action(context, None)
-            await update.message.reply_text("✅ Magasin ajouté.\n\n" + format_stores_list(), reply_markup=settings_stores_kb())
-            return SETTINGS_MENU
+            await update.message.reply_text(
+                store_wizard_prompt(next_step, data_payload),
+                reply_markup=store_wizard_cancel_kb(),
+            )
+            return SETTINGS_INPUT
 
         if action["type"] == "STORE_FIELD":
             store = get_store(action["store_id"], active_only=False)
