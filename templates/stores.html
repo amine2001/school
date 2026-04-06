@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Magasins{% endblock %}
+{% block content %}
+  <section class="panel section-head">
+    <div>
+      <p class="eyebrow">Référentiel</p>
+      <h2>Magasins</h2>
+      <p class="muted">Ajoute un magasin, modifie son nom, ses coordonnées, sa limite livreurs et sa capacité sans passer par les CSV.</p>
+    </div>
+    <a class="button-link" href="{{ url_for('admin_store_new') }}">Ajouter un magasin</a>
+  </section>
+
+  <section class="panel">
+    <div class="table-shell">
+      <table>
+        <thead>
+          <tr>
+            <th>Code</th>
+            <th>Nom</th>
+            <th>Coordonnées</th>
+            <th>Livreurs max</th>
+            <th>Capacité</th>
+            <th>Statut</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for store in stores %}
+            <tr>
+              <td>{{ store.store_id }}</td>
+              <td>{{ store.store_name }}</td>
+              <td>{{ "%.6f"|format(store.lat) }}, {{ "%.6f"|format(store.lon) }}</td>
+              <td>{{ store.max_drivers }}</td>
+              <td>{{ store.capacity }}</td>
+              <td>
+                <span class="pill {{ 'ok' if store.is_active else 'off' }}">
+                  {{ 'Actif' if store.is_active else 'Inactif' }}
+                </span>
+              </td>
+              <td class="actions-cell">
+                <a class="inline-link" href="{{ url_for('admin_store_edit', store_id=store.store_id) }}">Modifier</a>
+                <form method="post" action="{{ url_for('admin_store_toggle', store_id=store.store_id) }}">
+                  <input type="hidden" name="is_active" value="{{ 0 if store.is_active else 1 }}">
+                  <button type="submit" class="ghost-button">
+                    {{ 'Désactiver' if store.is_active else 'Réactiver' }}
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="7" class="empty-row">Aucun magasin disponible.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

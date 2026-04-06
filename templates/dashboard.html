@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+  <section class="hero panel">
+    <div>
+      <p class="eyebrow">Pilotage</p>
+      <h2>Le bot est maintenant administrable depuis le web</h2>
+      <p class="muted">Modifie la configuration métier, ajuste les magasins et lance un planning sans éditer `bot.py`.</p>
+    </div>
+    <div class="hero-actions">
+      <a class="button-link" href="{{ url_for('admin_settings') }}">Modifier les paramètres</a>
+      <a class="button-link secondary" href="{{ url_for('admin_planner') }}">Ouvrir la planification</a>
+    </div>
+  </section>
+
+  <section class="metrics-grid">
+    <article class="metric-card">
+      <span>Magasins actifs</span>
+      <strong>{{ stats.stores_active }}</strong>
+      <small>sur {{ stats.stores_total }} magasins enregistrés</small>
+    </article>
+    <article class="metric-card">
+      <span>Créneaux configurés</span>
+      <strong>{{ stats.slots_total }}</strong>
+      <small>pilotés depuis les paramètres</small>
+    </article>
+    <article class="metric-card">
+      <span>Max commandes</span>
+      <strong>{{ stats.max_orders }}</strong>
+      <small>limite actuelle du parsing Redash</small>
+    </article>
+    <article class="metric-card">
+      <span>Temps solveur</span>
+      <strong>{{ stats.planner_time_limit_sec }}s</strong>
+      <small>limite OR-Tools par optimisation</small>
+    </article>
+  </section>
+
+  <section class="grid-two">
+    <article class="panel">
+      <p class="eyebrow">Source</p>
+      <h3>Redash</h3>
+      <p class="muted break-all">{{ stats.redash_host }}</p>
+    </article>
+
+    <article class="panel">
+      <p class="eyebrow">Magasins récents</p>
+      <h3>Vue rapide</h3>
+      <div class="list-rows">
+        {% for store in stores[:5] %}
+          <div class="list-row">
+            <div>
+              <strong>{{ store.store_name }}</strong>
+              <small>{{ store.store_id }}</small>
+            </div>
+            <span class="pill {{ 'ok' if store.is_active else 'off' }}">
+              {{ 'Actif' if store.is_active else 'Inactif' }}
+            </span>
+          </div>
+        {% else %}
+          <p class="muted">Aucun magasin enregistré.</p>
+        {% endfor %}
+      </div>
+    </article>
+  </section>
+{% endblock %}

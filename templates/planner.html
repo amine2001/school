@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% block title %}Planification{% endblock %}
+{% block content %}
+  <section class="panel section-head">
+    <div>
+      <p class="eyebrow">Opérations</p>
+      <h2>Planification web</h2>
+      <p class="muted">Lance la même optimisation que le bot Telegram, mais depuis le navigateur.</p>
+    </div>
+  </section>
+
+  <section class="grid-two">
+    <form method="post" class="panel stack-form" id="planner-form">
+      <label>
+        <span>Magasin</span>
+        <select name="store_id" id="store-select" required>
+          <option value="">Choisir un magasin</option>
+          {% for store in stores %}
+            <option value="{{ store.store_id }}" {% if planner.store_id == store.store_id %}selected{% endif %}>
+              {{ store.store_name }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        <span>Date</span>
+        <select name="day_of_delivery" id="date-select" required {% if not planner.available_dates %}disabled{% endif %}>
+          <option value="">{{ 'Choisir d’abord un magasin' if not planner.available_dates else 'Choisir une date' }}</option>
+          {% for date_value in planner.available_dates %}
+            <option value="{{ date_value }}" {% if planner.day_of_delivery == date_value %}selected{% endif %}>
+              {{ date_value }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        <span>Créneau</span>
+        <select name="slot" required>
+          <option value="">Choisir un créneau</option>
+          {% for slot in settings.slots %}
+            <option value="{{ slot }}" {% if planner.slot == slot %}selected{% endif %}>
+              {{ slot }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        <span>Livreurs demandés</span>
+        <input type="number" name="num_drivers" value="{{ planner.num_drivers or 1 }}" min="1" required>
+      </label>
+
+      <button type="submit">Calculer la tournée</button>
+    </form>
+
+    <section class="panel">
+      <h3>Conseils</h3>
+      <ul class="flat-list">
+        <li>Les dates disponibles viennent directement de Redash pour le magasin sélectionné.</li>
+        <li>Le nombre de livreurs reste plafonné par les règles du magasin.</li>
+        <li>La capacité magasin est stockée dans l'admin et remontée dans la synthèse web.</li>
+      </ul>
+    </section>
+  </section>
+
+  {% if result %}
+    <section class="panel planning-summary">
+      <div class="summary-head">
+        <div>
+          <p class="eyebrow">Résultat</p>
+          <h3>{{ result.store_name }} · {{ result.day_of_delivery }} · {{ result.slot }}</h3>
+        </div>
+        <div class="summary-stats">
+          <span class="pill ok">{{ result.order_count }} commandes</span>
+          <span class="pill">{{ result.num_drivers }} livreurs retenus</span>
+          <span class="pill">{{ result.store_cap }} max magasin</span>
+          {% if result.capacity > 0 %}
+            <span class="pill">{{ result.capacity }} capacité</span>
+          {% endif %}
+        </div>
+      </div>
+
+      {% if result.warning %}
+        <div class="notice-card warning">
+          <strong>Attention</strong>
+          <p>{{ result.warning }}</p>
+        </div>
+      {% endif %}
+
+      <div class="routes-grid">
+        {% for route in result.routes %}
+          <article class="route-card">
+            <div class="route-head">
+              <strong>Livreur {{ route.driver_number }}</strong>
+              <span>{{ route.order_count }} commandes</span>
+            </div>
+            {% if route.order_ids %}
+              <p class="route-seq">{{ route.order_ids | join(' → ') }}</p>
+              <a class="inline-link" href="{{ route.map_url }}" target="_blank" rel="noopener noreferrer">Ouvrir dans Google Maps</a>
+            {% else %}
+              <p class="muted">Aucune commande attribuée.</p>
+            {% endif %}
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <script>
+    const storeSelect = document.getElementById("store-select");
+    const dateSelect = document.getElementById("date-select");
+
+    async function loadDates(selectedStoreId, keepValue) {
+      if (!selectedStoreId) {
+        dateSelect.innerHTML = '<option value="">Choisir d’abord un magasin</option>';
+        dateSelect.disabled = true;
+        return;
+      }
+
+      dateSelect.disabled = true;
+      dateSelect.innerHTML = '<option value="">Chargement...</option>';
+
+      try {
+        const response = await fetch(`/admin/api/stores/${encodeURIComponent(selectedStoreId)}/dates`);
+        const payload = await response.json();
+        const dates = payload.dates || [];
+
+        if (!dates.length) {
+          dateSelect.innerHTML = '<option value="">Aucune date disponible</option>';
+          return;
+        }
+
+        const options = ['<option value="">Choisir une date</option>'];
+        for (const dateValue of dates) {
+          const selected = keepValue === dateValue ? ' selected' : '';
+          options.push(`<option value="${dateValue}"${selected}>${dateValue}</option>`);
+        }
+        dateSelect.innerHTML = options.join("");
+      } catch (error) {
+        dateSelect.innerHTML = '<option value="">Erreur de chargement</option>';
+      } finally {
+        dateSelect.disabled = false;
+      }
+    }
+
+    storeSelect?.addEventListener("change", () => loadDates(storeSelect.value, ""));
+
+    if (storeSelect?.value && !dateSelect.querySelector("option[selected]")) {
+      loadDates(storeSelect.value, "{{ planner.day_of_delivery }}");
+    }
+  </script>
+{% endblock %}

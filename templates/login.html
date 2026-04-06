@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Connexion Admin{% endblock %}
+{% block content %}
+  <section class="auth-layout">
+    <div class="panel auth-card">
+      <p class="eyebrow">Administration</p>
+      <h2>Connexion</h2>
+      <p class="muted">Accède au panneau web pour modifier les magasins, les règles de planning et la source Redash sans toucher au code.</p>
+
+      <form method="post" class="stack-form">
+        <label>
+          <span>Utilisateur</span>
+          <input type="text" name="username" placeholder="admin" required>
+        </label>
+        <label>
+          <span>Mot de passe</span>
+          <input type="password" name="password" placeholder="••••••••" required>
+        </label>
+        <button type="submit">Se connecter</button>
+      </form>
+
+      <div class="notice-card">
+        <strong>Identifiants par défaut</strong>
+        <p>Configure `ADMIN_USERNAME` et `ADMIN_PASSWORD` dans les variables d'environnement pour sécuriser l'accès.</p>
+      </div>
+    </div>
+  </section>
+{% endblock %}

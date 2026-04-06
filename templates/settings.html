@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Paramètres{% endblock %}
+{% block content %}
+  <section class="panel section-head">
+    <div>
+      <p class="eyebrow">Configuration globale</p>
+      <h2>Paramètres du bot</h2>
+      <p class="muted">Ces valeurs remplacent les constantes codées en dur et sont utilisées par Telegram comme par l'interface web.</p>
+    </div>
+  </section>
+
+  <form method="post" class="grid-two settings-form">
+    <section class="panel">
+      <h3>Source de données</h3>
+      <label>
+        <span>URL Redash CSV</span>
+        <input type="url" name="redash_results_csv_url" value="{{ settings.redash_results_csv_url }}" required>
+      </label>
+      <label>
+        <span>API key Redash</span>
+        <input type="text" name="redash_api_key" value="{{ settings.redash_api_key }}" placeholder="Optionnel si déjà inclus dans l'URL">
+      </label>
+      <label>
+        <span>Nombre max de commandes chargées</span>
+        <input type="number" name="max_orders" value="{{ settings.max_orders }}" min="1" required>
+      </label>
+      <label>
+        <span>Temps max du solveur OR-Tools (secondes)</span>
+        <input type="number" name="planner_time_limit_sec" value="{{ settings.planner_time_limit_sec }}" min="1" required>
+      </label>
+    </section>
+
+    <section class="panel">
+      <h3>Règles métier</h3>
+      <label>
+        <span>Status requis</span>
+        <input type="text" name="required_status" value="{{ settings.required_status }}" placeholder="new">
+      </label>
+      <label>
+        <span>Delivery Type requis</span>
+        <input type="text" name="required_delivery_type" value="{{ settings.required_delivery_type }}" placeholder="planned order">
+      </label>
+      <label>
+        <span>Créneaux fixes</span>
+        <textarea name="slots" rows="8" placeholder="Un créneau par ligne">{% for slot in settings.slots %}{{ slot }}{% if not loop.last %}
+{% endif %}{% endfor %}</textarea>
+      </label>
+    </section>
+
+    <section class="panel">
+      <h3>SLA Acceptation & Préparation</h3>
+      <label>
+        <span>Acceptation max (minutes)</span>
+        <input type="number" name="accept_max_min" value="{{ settings.accept_max_min }}" min="0" required>
+      </label>
+      <label>
+        <span>Préparation max (minutes)</span>
+        <input type="number" name="prep_max_min" value="{{ settings.prep_max_min }}" min="0" required>
+      </label>
+    </section>
+
+    <section class="panel">
+      <h3>SLA Chargement & Livraison</h3>
+      <label>
+        <span>Chargement max (minutes)</span>
+        <input type="number" name="load_max_min" value="{{ settings.load_max_min }}" min="0" required>
+      </label>
+      <label>
+        <span>Livraison max (minutes)</span>
+        <input type="number" name="deliv_max_min" value="{{ settings.deliv_max_min }}" min="0" required>
+      </label>
+    </section>
+
+    <div class="form-actions">
+      <button type="submit">Enregistrer les paramètres</button>
+    </div>
+  </form>
+{% endblock %}

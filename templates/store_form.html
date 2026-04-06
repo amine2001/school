@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Modifier' if store else 'Ajouter' }} un magasin{% endblock %}
+{% block content %}
+  <section class="panel section-head">
+    <div>
+      <p class="eyebrow">Magasin</p>
+      <h2>{{ 'Modifier' if store else 'Ajouter' }} un magasin</h2>
+      <p class="muted">Les changements sont immédiatement disponibles dans le bot Telegram et dans la planification web.</p>
+    </div>
+  </section>
+
+  <form method="post" class="panel stack-form">
+    <div class="grid-two">
+      <label>
+        <span>Code magasin</span>
+        <input type="text" name="store_id" value="{{ store.store_id if store else '' }}" placeholder="HBF" required>
+      </label>
+      <label>
+        <span>Nom magasin</span>
+        <input type="text" name="store_name" value="{{ store.store_name if store else '' }}" placeholder="Hyper Borj Fes" required>
+      </label>
+      <label>
+        <span>Latitude</span>
+        <input type="number" step="any" name="lat" value="{{ store.lat if store else '' }}" required>
+      </label>
+      <label>
+        <span>Longitude</span>
+        <input type="number" step="any" name="lon" value="{{ store.lon if store else '' }}" required>
+      </label>
+      <label>
+        <span>Nombre max de livreurs</span>
+        <input type="number" name="max_drivers" value="{{ store.max_drivers if store else 5 }}" min="0" required>
+      </label>
+      <label>
+        <span>Capacité magasin</span>
+        <input type="number" name="capacity" value="{{ store.capacity if store else 0 }}" min="0" required>
+      </label>
+    </div>
+
+    <label class="toggle">
+      <input type="checkbox" name="is_active" value="1" {% if not store or store.is_active %}checked{% endif %}>
+      <span>Magasin actif</span>
+    </label>
+
+    <div class="form-actions">
+      <button type="submit">{{ 'Enregistrer les changements' if store else 'Créer le magasin' }}</button>
+      <a class="button-link secondary" href="{{ url_for('admin_stores') }}">Retour</a>
+    </div>
+  </form>
+{% endblock %}

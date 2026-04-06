@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+bringo_admin.db
+instance/
+.env
+*.log

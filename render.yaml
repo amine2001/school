@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: bringo-routes-optimizer-v2
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bot:flask_app --bind 0.0.0.0:$PORT --workers 1 --threads 8
+    disk:
+      name: bringo-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: APP_DB_PATH
+        value: /var/data/bringo_admin.db
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: REDASH_RESULTS_CSV_URL
+        sync: false
+      - key: REDASH_API_KEY
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false

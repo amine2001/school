@@ -9,11 +9,22 @@ import asyncio
 import atexit
 import datetime
 import unicodedata
+from functools import wraps
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
 import requests
-from flask import Flask, request
+from flask import (
+    Flask,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -29,23 +40,35 @@ from telegram.error import BadRequest
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
+from admin_store import (
+    DEFAULT_REDASH_RESULTS_CSV_URL,
+    find_store_by_name,
+    get_app_settings,
+    get_dashboard_stats,
+    get_store,
+    init_db,
+    list_stores,
+    save_store,
+    set_store_active,
+    update_app_settings,
+)
+
 # ============================
 # CONFIG (Render Env Vars)
 # ============================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # required
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")        # required ex: https://bringo-bot.onrender.com/webhook
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+ADMIN_USER_IDS = {
+    int(chunk.strip())
+    for chunk in (os.getenv("ADMIN_USER_IDS") or "").split(",")
+    if chunk.strip().isdigit()
+}
 
-# Redash CSV endpoint (can include ?api_key=... already)
-REDASH_RESULTS_CSV_URL = os.getenv(
-    "REDASH_RESULTS_CSV_URL",
-    "https://redash-ro-live.bringo.ro/api/queries/4441/results.csv"
-)
-
-# OPTIONAL: if you prefer key separated (do NOT put an URL here, only the key)
-REDASH_API_KEY = os.getenv("REDASH_API_KEY", "").strip()
-
-STORES_CSV_PATH = os.getenv("STORES_CSV_PATH", "stores_coords.csv")
-MAX_ORDERS = int(os.getenv("MAX_ORDERS", "150"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "").strip()
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "bringo-control-room")
 
 # ✅ Max livreurs autorisés par magasin (cap recommandation + choix)
 # (Tu peux ajuster cette table sans toucher au reste du code)
@@ -90,12 +113,42 @@ DELIV_MAX_MIN  = int(os.getenv("DELIV_MAX_MIN",  "120"))
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bringo-bot")
+init_db()
+DEFAULT_ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD)
+
+
+def runtime_settings() -> Dict:
+    return get_app_settings()
+
+
+def configured_slots() -> List[str]:
+    return runtime_settings().get("slots", [])
+
+
+def get_admin_password_hash() -> str:
+    if ADMIN_PASSWORD_HASH:
+        return ADMIN_PASSWORD_HASH
+    return DEFAULT_ADMIN_PASSWORD_HASH
+
+
+def resolve_webhook_url() -> str:
+    if WEBHOOK_URL:
+        return WEBHOOK_URL
+    if RENDER_EXTERNAL_URL:
+        return f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
+    return ""
+
+
+def admin_ids_text() -> str:
+    if not ADMIN_USER_IDS:
+        return "non configuré"
+    return ", ".join(str(item) for item in sorted(ADMIN_USER_IDS))
 
 
 # ============================
 # Telegram Conversation States
 # ============================
-(CHOOSE_STORE, CHOOSE_DATE, CHOOSE_SLOT, CHOOSE_DRIVERS, ORDERS_MENU, ORDER_INPUT, STORE_MENU) = range(7)
+(CHOOSE_STORE, CHOOSE_DATE, CHOOSE_SLOT, CHOOSE_DRIVERS, ORDERS_MENU, ORDER_INPUT, STORE_MENU, SETTINGS_MENU, SETTINGS_INPUT) = range(9)
 
 # context keys
 CTX_STORES = "stores"
@@ -107,6 +160,8 @@ CTX_DATE = "date"
 CTX_SLOT = "slot"
 CTX_NUM_DRIVERS = "num_drivers"
 CTX_MAX_DRIVERS_ALLOWED = "max_drivers_allowed"
+CTX_SETTINGS_ACTION = "settings_action"
+CTX_SETTINGS_STORE_ID = "settings_store_id"
 
 
 # ============================
@@ -173,20 +228,24 @@ def norm_store_key(s: str) -> str:
 # ============================
 # Helpers: Redash fetch
 # ============================
-def _with_api_key(url: str) -> str:
-    """Append api_key param only if REDASH_API_KEY exists and api_key not already present."""
-    if not REDASH_API_KEY:
+def _with_api_key(url: str, api_key: str) -> str:
+    """Append api_key param only if api_key exists and api_key not already present."""
+    if not api_key:
         return url
     u = urlparse(url)
     q = dict(parse_qsl(u.query))
     if "api_key" in q and q["api_key"]:
         return url
-    q["api_key"] = REDASH_API_KEY
+    q["api_key"] = api_key
     return urlunparse(u._replace(query=urlencode(q)))
 
 
 def fetch_redash_csv_text() -> str:
-    url = _with_api_key(REDASH_RESULTS_CSV_URL)
+    settings = runtime_settings()
+    url = _with_api_key(
+        settings.get("redash_results_csv_url") or DEFAULT_REDASH_RESULTS_CSV_URL,
+        settings.get("redash_api_key") or "",
+    )
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.text
@@ -243,6 +302,11 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
     - Debut De Creneau, Fin De Creneau -> build slot 'HH:MM - HH:MM'
     - LatLong (or Latitude/Longitude)
     """
+    settings = runtime_settings()
+    required_status = norm_text(settings.get("required_status"))
+    required_delivery_type = norm_text(settings.get("required_delivery_type"))
+    max_orders = int(settings.get("max_orders") or 150)
+
     f = io.StringIO(csv_text)
     reader = csv.DictReader(f)
 
@@ -273,11 +337,11 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
             continue
 
         # ✅ ONLY NEW (others ignored)
-        if status != REQUIRED_STATUS:
+        if required_status and status != required_status:
             continue
 
         # ✅ ONLY Planned Order
-        if delivery_type != REQUIRED_DELIVERY_TYPE:
+        if required_delivery_type and delivery_type != required_delivery_type:
             continue
 
         rows.append({
@@ -292,8 +356,8 @@ def parse_redash_rows(csv_text: str) -> List[Dict]:
             "raw": row,
         })
 
-    if len(rows) > MAX_ORDERS:
-        rows = rows[:MAX_ORDERS]
+    if len(rows) > max_orders:
+        rows = rows[:max_orders]
     return rows
 
 
@@ -531,6 +595,11 @@ def build_magasin_summary(rows_all: List[Dict], mode: str) -> str:
     Summary (global, not per store), with emojis.
     """
     now = datetime.datetime.utcnow()
+    settings = runtime_settings()
+    accept_max_min = int(settings.get("accept_max_min") or 10)
+    prep_max_min = int(settings.get("prep_max_min") or 60)
+    load_max_min = int(settings.get("load_max_min") or 20)
+    deliv_max_min = int(settings.get("deliv_max_min") or 120)
 
     def keep(o: Dict) -> bool:
         if mode == "HYPER":
@@ -575,13 +644,13 @@ def build_magasin_summary(rows_all: List[Dict], mode: str) -> str:
                 return False
             return (now - ref_dt).total_seconds() > max_min * 60
 
-        if is_late(accept_dt, order_date, ACCEPT_MAX_MIN):
+        if is_late(accept_dt, order_date, accept_max_min):
             accept_late += 1
-        if is_late(prep_end, accept_dt or order_date, PREP_MAX_MIN):
+        if is_late(prep_end, accept_dt or order_date, prep_max_min):
             prep_late += 1
-        if is_late(load_dt, prep_end or accept_dt or order_date, LOAD_MAX_MIN):
+        if is_late(load_dt, prep_end or accept_dt or order_date, load_max_min):
             load_late += 1
-        if is_late(close_dt, load_dt or prep_end or accept_dt or order_date, DELIV_MAX_MIN):
+        if is_late(close_dt, load_dt or prep_end or accept_dt or order_date, deliv_max_min):
             deliv_late += 1
 
     lines = [
@@ -654,7 +723,12 @@ def build_distance_matrix(points: List[Tuple[float, float]]) -> List[List[int]]:
     return mat
 
 
-def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]], num_vehicles: int) -> List[List[int]]:
+def solve_vrp(
+    depot: Tuple[float, float],
+    orders: List[Tuple[str, float, float]],
+    num_vehicles: int,
+    time_limit_seconds: Optional[int] = None,
+) -> List[List[int]]:
     """
     VRP tuned to:
       - NEVER return "0 orders for everyone" (huge drop penalty)
@@ -724,7 +798,9 @@ def solve_vrp(depot: Tuple[float, float], orders: List[Tuple[str, float, float]]
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.AUTOMATIC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(12)
+    if time_limit_seconds is None:
+        time_limit_seconds = int(runtime_settings().get("planner_time_limit_sec") or 12)
+    params.time_limit.FromSeconds(max(1, int(time_limit_seconds)))
 
     solution = routing.SolveWithParameters(params)
     if not solution:
@@ -780,7 +856,19 @@ def get_store_max_drivers(store_name: str) -> int:
     """Return max allowed drivers for a store (fallback 10 if unknown)."""
     if not store_name:
         return 10
-    return int(MAX_DRIVERS_BY_STORE.get(store_name.strip(), 10))
+    store = find_store_by_name(store_name, active_only=False)
+    if not store:
+        return 10
+    return int(store.get("max_drivers") or 10)
+
+
+def get_store_capacity(store_name: str) -> int:
+    if not store_name:
+        return 0
+    store = find_store_by_name(store_name, active_only=False)
+    if not store:
+        return 0
+    return int(store.get("capacity") or 0)
 
 
 def compute_allowed_driver_choices(store_name: str, orders_count: int) -> int:
@@ -802,22 +890,703 @@ async def ensure_redash_cache(context: ContextTypes.DEFAULT_TYPE, force: bool = 
 
 
 async def ensure_stores(context: ContextTypes.DEFAULT_TYPE) -> List[Dict]:
-    if context.user_data.get(CTX_STORES):
-        return context.user_data[CTX_STORES]
-    stores = load_stores_from_csv(STORES_CSV_PATH)
+    stores = list_stores(active_only=True)
     context.user_data[CTX_STORES] = stores
     return stores
+
+
+def build_store_keyboard(stores: List[Dict]) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(store["store_name"], callback_data=f"STORE::{store['store_id']}")
+        for store in stores
+    ]
+    keyboard = chunk_buttons(buttons, per_row=2)
+    keyboard.append([InlineKeyboardButton("Menu", callback_data="BACK_MENU")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_effective_user_id(update: Update) -> Optional[int]:
+    user = update.effective_user
+    return user.id if user else None
+
+
+def is_admin_user_id(user_id: Optional[int]) -> bool:
+    return bool(user_id and user_id in ADMIN_USER_IDS)
+
+
+def is_admin_update(update: Update) -> bool:
+    return is_admin_user_id(get_effective_user_id(update))
+
+
+def set_settings_action(context: ContextTypes.DEFAULT_TYPE, action: Optional[Dict]) -> None:
+    if action is None:
+        context.user_data.pop(CTX_SETTINGS_ACTION, None)
+        context.user_data.pop(CTX_SETTINGS_STORE_ID, None)
+        return
+    context.user_data[CTX_SETTINGS_ACTION] = action
+    if action.get("store_id"):
+        context.user_data[CTX_SETTINGS_STORE_ID] = action["store_id"]
+
+
+def get_settings_action(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict]:
+    action = context.user_data.get(CTX_SETTINGS_ACTION)
+    return action if isinstance(action, dict) else None
+
+
+def mask_secret(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return "-"
+    if len(value) <= 6:
+        return "*" * len(value)
+    return value[:4] + "*" * (len(value) - 6) + value[-2:]
+
+
+def settings_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Magasins", callback_data="SET::SEC::STORES")],
+        [InlineKeyboardButton("Créneaux", callback_data="SET::SEC::SLOTS")],
+        [InlineKeyboardButton("Redash", callback_data="SET::SEC::REDASH")],
+        [InlineKeyboardButton("Règles", callback_data="SET::SEC::RULES")],
+        [InlineKeyboardButton("SLA", callback_data="SET::SEC::SLA")],
+        [InlineKeyboardButton("Infos", callback_data="SET::SEC::INFO")],
+        [InlineKeyboardButton("Fermer", callback_data="SET::CLOSE")],
+    ])
+
+
+def settings_stores_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Voir les magasins", callback_data="SET::STORES::LIST")],
+        [InlineKeyboardButton("Modifier un magasin", callback_data="SET::STORES::EDIT")],
+        [InlineKeyboardButton("Ajouter un magasin", callback_data="SET::STORES::ADD")],
+        [InlineKeyboardButton("Retour", callback_data="SET::ROOT")],
+    ])
+
+
+def settings_store_select_kb() -> InlineKeyboardMarkup:
+    stores = list_stores(active_only=False)
+    rows = []
+    for store in stores:
+        label = f"{'🟢' if store['is_active'] else '⚪'} {store['store_name']}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"SET::STORE::{store['store_id']}")])
+    rows.append([InlineKeyboardButton("Retour", callback_data="SET::SEC::STORES")])
+    return InlineKeyboardMarkup(rows)
+
+
+def settings_store_detail_kb(store: Dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Nom", callback_data=f"SET::STOREFIELD::NAME::{store['store_id']}")],
+        [InlineKeyboardButton("Max livreurs", callback_data=f"SET::STOREFIELD::MAXDRIVERS::{store['store_id']}")],
+        [InlineKeyboardButton("Capacité", callback_data=f"SET::STOREFIELD::CAPACITY::{store['store_id']}")],
+        [InlineKeyboardButton("Coordonnées", callback_data=f"SET::STOREFIELD::COORDS::{store['store_id']}")],
+        [InlineKeyboardButton("Activer / Désactiver", callback_data=f"SET::STORETOGGLE::{store['store_id']}")],
+        [InlineKeyboardButton("Retour", callback_data="SET::STORES::EDIT")],
+    ])
+
+
+def settings_slots_kb() -> InlineKeyboardMarkup:
+    slots = configured_slots()
+    rows = [[InlineKeyboardButton("Ajouter un créneau", callback_data="SET::SLOTS::ADD")]]
+    for idx, slot in enumerate(slots):
+        rows.append([InlineKeyboardButton(f"Supprimer {slot}", callback_data=f"SET::SLOTDEL::{idx}")])
+    rows.append([InlineKeyboardButton("Retour", callback_data="SET::ROOT")])
+    return InlineKeyboardMarkup(rows)
+
+
+def settings_redash_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Changer l'URL CSV", callback_data="SET::REDASH::URL")],
+        [InlineKeyboardButton("Changer l'API key", callback_data="SET::REDASH::APIKEY")],
+        [InlineKeyboardButton("Tester la connexion", callback_data="SET::REDASH::TEST")],
+        [InlineKeyboardButton("Retour", callback_data="SET::ROOT")],
+    ])
+
+
+def settings_rules_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Status requis", callback_data="SET::RULE::STATUS")],
+        [InlineKeyboardButton("Delivery Type requis", callback_data="SET::RULE::DTYPE")],
+        [InlineKeyboardButton("Max commandes", callback_data="SET::RULE::MAXORDERS")],
+        [InlineKeyboardButton("Retour", callback_data="SET::ROOT")],
+    ])
+
+
+def settings_sla_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Acceptation", callback_data="SET::SLA::ACCEPT")],
+        [InlineKeyboardButton("Préparation", callback_data="SET::SLA::PREP")],
+        [InlineKeyboardButton("Chargement", callback_data="SET::SLA::LOAD")],
+        [InlineKeyboardButton("Livraison", callback_data="SET::SLA::DELIV")],
+        [InlineKeyboardButton("Retour", callback_data="SET::ROOT")],
+    ])
+
+
+def format_store_settings(store: Dict) -> str:
+    return "\n".join([
+        f"🏬 {store['store_name']}",
+        f"Code: {store['store_id']}",
+        f"Coordonnées: {store['lat']}, {store['lon']}",
+        f"Max livreurs: {store['max_drivers']}",
+        f"Capacité: {store['capacity']}",
+        f"Statut: {'Actif' if store['is_active'] else 'Inactif'}",
+    ])
+
+
+def format_settings_info() -> str:
+    settings = runtime_settings()
+    stats = get_dashboard_stats()
+    return "\n".join([
+        "⚙️ Bringo Routes Optimizer V2",
+        "",
+        f"Admins Telegram: {admin_ids_text()}",
+        f"Magasins actifs: {stats['stores_active']}/{stats['stores_total']}",
+        f"Créneaux: {stats['slots_total']}",
+        f"Max commandes: {settings['max_orders']}",
+        f"Status requis: {settings['required_status'] or '-'}",
+        f"Delivery Type requis: {settings['required_delivery_type'] or '-'}",
+        f"Temps solveur: {settings['planner_time_limit_sec']}s",
+        f"Redash API key: {mask_secret(settings['redash_api_key'])}",
+    ])
+
+
+def format_stores_list() -> str:
+    stores = list_stores(active_only=False)
+    if not stores:
+        return "Aucun magasin configuré."
+    lines = ["🏬 Magasins configurés", ""]
+    for store in stores:
+        lines.append(
+            f"{'🟢' if store['is_active'] else '⚪'} {store['store_name']} | "
+            f"{store['store_id']} | max={store['max_drivers']} | cap={store['capacity']}"
+        )
+    return "\n".join(lines)
+
+
+def parse_store_payload(raw_text: str) -> Dict:
+    parts = [part.strip() for part in (raw_text or "").split("|")]
+    if len(parts) != 6:
+        raise ValueError(
+            "Format invalide. Utilise: CODE | Nom magasin | latitude | longitude | max_livreurs | capacité"
+        )
+    return {
+        "store_id": parts[0],
+        "store_name": parts[1],
+        "lat": float(parts[2]),
+        "lon": float(parts[3]),
+        "max_drivers": int(parts[4]),
+        "capacity": int(parts[5]),
+        "is_active": True,
+    }
+
+
+def build_route_plan(
+    store: Dict,
+    day_of_delivery: str,
+    slot: str,
+    requested_drivers: int,
+    rows: Optional[List[Dict]] = None,
+) -> Dict:
+    if rows is None:
+        rows = parse_redash_rows(fetch_redash_csv_text())
+
+    store_name = store["store_name"]
+    depot = (store["lat"], store["lon"])
+    orders = filter_orders(rows, store_name, slot, day_of_delivery)
+    store_cap = get_store_max_drivers(store_name)
+    allowed_max = compute_allowed_driver_choices(store_name, len(orders))
+    selected_drivers = max(1, int(requested_drivers or 1))
+    if allowed_max <= 0:
+        selected_drivers = 0
+    else:
+        selected_drivers = min(selected_drivers, allowed_max)
+
+    routes_nodes = solve_vrp(depot, orders, selected_drivers) if orders and selected_drivers > 0 else []
+    capacity = int(store.get("capacity") or 0)
+
+    routes = []
+    for index in range(selected_drivers):
+        stops_nodes = routes_nodes[index] if index < len(routes_nodes) else []
+        stop_orders = [orders[node - 1] for node in stops_nodes]
+        order_ids = [order[0] for order in stop_orders]
+        latlons = [(order[1], order[2]) for order in stop_orders]
+        routes.append(
+            {
+                "driver_number": index + 1,
+                "order_count": len(order_ids),
+                "order_ids": order_ids,
+                "map_url": google_maps_link(depot, latlons) if order_ids else "",
+            }
+        )
+
+    warning = ""
+    if requested_drivers and allowed_max > 0 and int(requested_drivers) > selected_drivers:
+        warning = f"Le nombre de livreurs demandé a été plafonné à {selected_drivers}."
+    elif capacity > 0 and len(orders) > capacity:
+        warning = (
+            f"La capacité configurée pour {store_name} est {capacity}, "
+            f"mais {len(orders)} commandes ont été trouvées pour ce créneau."
+        )
+
+    return {
+        "store_id": store["store_id"],
+        "store_name": store_name,
+        "day_of_delivery": day_of_delivery,
+        "slot": slot,
+        "order_count": len(orders),
+        "store_cap": store_cap,
+        "capacity": capacity,
+        "allowed_max": allowed_max,
+        "requested_drivers": int(requested_drivers or 1),
+        "num_drivers": selected_drivers if orders else 0,
+        "routes": routes,
+        "warning": warning,
+    }
+
+
+def format_route_plan_text(result: Dict) -> str:
+    lines = [
+        f"📍 Magasin: {result['store_name']}",
+        f"📅 Date: {result['day_of_delivery']}",
+        f"🕒 Créneau: {result['slot']}",
+        f"📦 Commandes: {result['order_count']}",
+        f"🚴 Livreurs: {result['num_drivers']}",
+        "",
+    ]
+
+    for route in result["routes"]:
+        if not route["order_ids"]:
+            lines += [f"👤 Livreur {route['driver_number']}: 0 commande", "—"]
+            continue
+
+        lines.append(f"👤 Livreur {route['driver_number']}: {route['order_count']} commandes")
+        lines.append("🧾 " + " → ".join(route["order_ids"]))
+        if route["map_url"]:
+            lines.append("🗺️ " + route["map_url"])
+        lines.append("—")
+
+    return "\n".join(lines)
 
 
 # ============================
 # Handlers
 # ============================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("/start received from chat_id=%s", update.effective_chat.id if update.effective_chat else None)
+    await ensure_stores(context)
+    if update.message:
+        extra = ""
+        if is_admin_update(update):
+            extra = "\nAdmin: utilise /settings pour modifier la configuration globale."
+        await update.message.reply_text(
+            "Bringo Routes Optimizer V2 ✅\nChoisis une action :" + extra,
+            reply_markup=main_menu_kb(),
+        )
+        return
     log.info("✅ /start received from chat_id=%s", update.effective_chat.id if update.effective_chat else None)
     await ensure_stores(context)
     if update.message:
         await update.message.reply_text("Bot Last Mile Bringo ✅\nChoisis une action :", reply_markup=main_menu_kb())
 
+
+
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Ton Telegram user id: {user.id if user else '-'}\nAdmins configurés: {admin_ids_text()}"
+    )
+
+
+async def deny_settings_access(update: Update):
+    text = (
+        "⛔ Accès admin refusé.\n"
+        "Configure ADMIN_USER_IDS avec ton Telegram user id puis redémarre le bot."
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=main_menu_kb())
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=main_menu_kb())
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_update(update):
+        await deny_settings_access(update)
+        return ConversationHandler.END
+
+    set_settings_action(context, None)
+    if update.message:
+        await update.message.reply_text(
+            "⚙️ Paramètres admin\nChoisis une section à modifier :",
+            reply_markup=settings_main_kb(),
+        )
+    return SETTINGS_MENU
+
+
+async def settings_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await safe_answer(q)
+
+    if not is_admin_update(update):
+        await deny_settings_access(update)
+        return ConversationHandler.END
+
+    data = q.data or ""
+    settings = runtime_settings()
+
+    if data == "SET::CLOSE":
+        set_settings_action(context, None)
+        await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    if data == "SET::ROOT":
+        set_settings_action(context, None)
+        await q.edit_message_text(
+            "⚙️ Paramètres admin\nChoisis une section à modifier :",
+            reply_markup=settings_main_kb(),
+        )
+        return SETTINGS_MENU
+
+    if data == "SET::SEC::STORES":
+        set_settings_action(context, None)
+        await q.edit_message_text("🏬 Gestion des magasins", reply_markup=settings_stores_kb())
+        return SETTINGS_MENU
+
+    if data == "SET::STORES::LIST":
+        await q.edit_message_text(format_stores_list(), reply_markup=settings_stores_kb())
+        return SETTINGS_MENU
+
+    if data == "SET::STORES::EDIT":
+        await q.edit_message_text(
+            "Choisis un magasin à modifier :",
+            reply_markup=settings_store_select_kb(),
+        )
+        return SETTINGS_MENU
+
+    if data == "SET::STORES::ADD":
+        set_settings_action(context, {"type": "ADD_STORE"})
+        await q.edit_message_text(
+            "Envoie le nouveau magasin avec ce format:\n"
+            "CODE | Nom magasin | latitude | longitude | max_livreurs | capacité",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data="SET::SEC::STORES")]]),
+        )
+        return SETTINGS_INPUT
+
+    if data.startswith("SET::STORE::"):
+        store_id = data.split("::", 2)[2]
+        store = get_store(store_id, active_only=False)
+        if not store:
+            await q.edit_message_text("❌ Magasin introuvable.", reply_markup=settings_store_select_kb())
+            return SETTINGS_MENU
+        await q.edit_message_text(format_store_settings(store), reply_markup=settings_store_detail_kb(store))
+        return SETTINGS_MENU
+
+    if data.startswith("SET::STORETOGGLE::"):
+        store_id = data.split("::", 2)[2]
+        store = get_store(store_id, active_only=False)
+        if not store:
+            await q.edit_message_text("❌ Magasin introuvable.", reply_markup=settings_store_select_kb())
+            return SETTINGS_MENU
+        set_store_active(store_id, not store["is_active"])
+        store = get_store(store_id, active_only=False)
+        await q.edit_message_text(
+            "✅ Statut du magasin mis à jour.\n\n" + format_store_settings(store),
+            reply_markup=settings_store_detail_kb(store),
+        )
+        return SETTINGS_MENU
+
+    if data.startswith("SET::STOREFIELD::"):
+        _, _, field, store_id = data.split("::", 3)
+        store = get_store(store_id, active_only=False)
+        if not store:
+            await q.edit_message_text("❌ Magasin introuvable.", reply_markup=settings_store_select_kb())
+            return SETTINGS_MENU
+        prompts = {
+            "NAME": "Envoie le nouveau nom du magasin. Il doit correspondre au nom utilisé dans Redash.",
+            "MAXDRIVERS": f"Envoie le nouveau max livreurs pour {store['store_name']}.",
+            "CAPACITY": f"Envoie la nouvelle capacité pour {store['store_name']}.",
+            "COORDS": "Envoie les coordonnées au format: latitude,longitude",
+        }
+        set_settings_action(context, {"type": "STORE_FIELD", "field": field, "store_id": store_id})
+        await q.edit_message_text(
+            prompts.get(field, "Envoie la nouvelle valeur."),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data=f"SET::STORE::{store_id}")]]),
+        )
+        return SETTINGS_INPUT
+
+    if data == "SET::SEC::SLOTS":
+        set_settings_action(context, None)
+        slots_text = "\n".join(f"• {slot}" for slot in configured_slots()) or "Aucun créneau."
+        await q.edit_message_text(
+            "🕒 Créneaux configurés\n\n" + slots_text,
+            reply_markup=settings_slots_kb(),
+        )
+        return SETTINGS_MENU
+
+    if data == "SET::SLOTS::ADD":
+        set_settings_action(context, {"type": "ADD_SLOT"})
+        await q.edit_message_text(
+            "Envoie le nouveau créneau au format HH:MM - HH:MM",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data="SET::SEC::SLOTS")]]),
+        )
+        return SETTINGS_INPUT
+
+    if data.startswith("SET::SLOTDEL::"):
+        idx = int(data.split("::", 2)[2])
+        slots = configured_slots()
+        if 0 <= idx < len(slots):
+            new_slots = [slot for pos, slot in enumerate(slots) if pos != idx]
+            if not new_slots:
+                await q.edit_message_text("❌ Il faut garder au moins un créneau.", reply_markup=settings_slots_kb())
+                return SETTINGS_MENU
+            update_app_settings({"slots": new_slots})
+            slots = new_slots
+        await q.edit_message_text(
+            "✅ Créneaux mis à jour.\n\n" + "\n".join(f"• {slot}" for slot in slots),
+            reply_markup=settings_slots_kb(),
+        )
+        return SETTINGS_MENU
+
+    if data == "SET::SEC::REDASH":
+        set_settings_action(context, None)
+        await q.edit_message_text(
+            "\n".join([
+                "🔗 Paramètres Redash",
+                "",
+                f"URL: {settings['redash_results_csv_url']}",
+                f"API key: {mask_secret(settings['redash_api_key'])}",
+            ]),
+            reply_markup=settings_redash_kb(),
+        )
+        return SETTINGS_MENU
+
+    if data == "SET::REDASH::URL":
+        set_settings_action(context, {"type": "REDASH_URL"})
+        await q.edit_message_text(
+            "Envoie la nouvelle URL CSV Redash.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data="SET::SEC::REDASH")]]),
+        )
+        return SETTINGS_INPUT
+
+    if data == "SET::REDASH::APIKEY":
+        set_settings_action(context, {"type": "REDASH_API_KEY"})
+        await q.edit_message_text(
+            "Envoie la nouvelle API key Redash.\nEnvoie VIDE pour supprimer la clé.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data="SET::SEC::REDASH")]]),
+        )
+        return SETTINGS_INPUT
+
+    if data == "SET::REDASH::TEST":
+        try:
+            csv_text = fetch_redash_csv_text()
+            rows = parse_redash_rows(csv_text)
+            rows_all = parse_redash_rows_all(csv_text)
+            await q.edit_message_text(
+                "\n".join([
+                    "✅ Connexion Redash OK",
+                    f"Lignes filtrées: {len(rows)}",
+                    f"Lignes totales: {len(rows_all)}",
+                ]),
+                reply_markup=settings_redash_kb(),
+            )
+        except Exception as exc:
+            await q.edit_message_text(f"❌ Test Redash échoué:\n{exc}", reply_markup=settings_redash_kb())
+        return SETTINGS_MENU
+
+    if data == "SET::SEC::RULES":
+        set_settings_action(context, None)
+        await q.edit_message_text(
+            "\n".join([
+                "📋 Règles métier",
+                "",
+                f"Status requis: {settings['required_status'] or '-'}",
+                f"Delivery Type requis: {settings['required_delivery_type'] or '-'}",
+                f"Max commandes: {settings['max_orders']}",
+            ]),
+            reply_markup=settings_rules_kb(),
+        )
+        return SETTINGS_MENU
+
+    if data.startswith("SET::RULE::"):
+        field = data.split("::", 2)[2]
+        prompts = {
+            "STATUS": "Envoie le status requis. Exemple: new",
+            "DTYPE": "Envoie le delivery type requis. Exemple: planned order",
+            "MAXORDERS": "Envoie le nouveau max commandes.",
+        }
+        set_settings_action(context, {"type": "RULE", "field": field})
+        await q.edit_message_text(
+            prompts.get(field, "Envoie la nouvelle valeur."),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data="SET::SEC::RULES")]]),
+        )
+        return SETTINGS_INPUT
+
+    if data == "SET::SEC::SLA":
+        set_settings_action(context, None)
+        await q.edit_message_text(
+            "\n".join([
+                "⏱ SLA",
+                "",
+                f"Acceptation: {settings['accept_max_min']} min",
+                f"Préparation: {settings['prep_max_min']} min",
+                f"Chargement: {settings['load_max_min']} min",
+                f"Livraison: {settings['deliv_max_min']} min",
+            ]),
+            reply_markup=settings_sla_kb(),
+        )
+        return SETTINGS_MENU
+
+    if data.startswith("SET::SLA::"):
+        field = data.split("::", 2)[2]
+        prompts = {
+            "ACCEPT": "Envoie le SLA acceptation en minutes.",
+            "PREP": "Envoie le SLA préparation en minutes.",
+            "LOAD": "Envoie le SLA chargement en minutes.",
+            "DELIV": "Envoie le SLA livraison en minutes.",
+        }
+        set_settings_action(context, {"type": "SLA", "field": field})
+        await q.edit_message_text(
+            prompts.get(field, "Envoie la nouvelle valeur."),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data="SET::SEC::SLA")]]),
+        )
+        return SETTINGS_INPUT
+
+    if data == "SET::SEC::INFO":
+        set_settings_action(context, None)
+        await q.edit_message_text(
+            format_settings_info(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data="SET::ROOT")]]),
+        )
+        return SETTINGS_MENU
+
+    await q.edit_message_text(
+        "⚙️ Paramètres admin\nChoisis une section à modifier :",
+        reply_markup=settings_main_kb(),
+    )
+    return SETTINGS_MENU
+
+
+async def settings_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_update(update):
+        await deny_settings_access(update)
+        return ConversationHandler.END
+
+    action = get_settings_action(context)
+    if not action:
+        await update.message.reply_text("Utilise les boutons de /settings.", reply_markup=settings_main_kb())
+        return SETTINGS_MENU
+
+    raw_text = (update.message.text or "").strip()
+
+    try:
+        if action["type"] == "ADD_STORE":
+            payload = parse_store_payload(raw_text)
+            save_store(
+                store_id=payload["store_id"],
+                store_name=payload["store_name"],
+                lat=payload["lat"],
+                lon=payload["lon"],
+                max_drivers=payload["max_drivers"],
+                capacity=payload["capacity"],
+                is_active=True,
+            )
+            set_settings_action(context, None)
+            await update.message.reply_text("✅ Magasin ajouté.\n\n" + format_stores_list(), reply_markup=settings_stores_kb())
+            return SETTINGS_MENU
+
+        if action["type"] == "STORE_FIELD":
+            store = get_store(action["store_id"], active_only=False)
+            if not store:
+                raise ValueError("Magasin introuvable.")
+
+            updated = dict(store)
+            field = action["field"]
+            if field == "NAME":
+                updated["store_name"] = raw_text
+            elif field == "MAXDRIVERS":
+                updated["max_drivers"] = parse_int_field(raw_text, "Le max livreurs", minimum=0)
+            elif field == "CAPACITY":
+                updated["capacity"] = parse_int_field(raw_text, "La capacité", minimum=0)
+            elif field == "COORDS":
+                lat_txt, lon_txt = [chunk.strip() for chunk in raw_text.split(",", 1)]
+                updated["lat"] = parse_float_field(lat_txt, "La latitude")
+                updated["lon"] = parse_float_field(lon_txt, "La longitude")
+            else:
+                raise ValueError("Action de magasin inconnue.")
+
+            save_store(
+                store_id=updated["store_id"],
+                store_name=updated["store_name"],
+                lat=updated["lat"],
+                lon=updated["lon"],
+                max_drivers=updated["max_drivers"],
+                capacity=updated["capacity"],
+                is_active=updated["is_active"],
+                original_store_id=store["store_id"],
+            )
+            store = get_store(updated["store_id"], active_only=False)
+            set_settings_action(context, None)
+            await update.message.reply_text("✅ Magasin mis à jour.\n\n" + format_store_settings(store), reply_markup=settings_store_detail_kb(store))
+            return SETTINGS_MENU
+
+        if action["type"] == "ADD_SLOT":
+            slots = configured_slots()
+            if raw_text in slots:
+                raise ValueError("Ce créneau existe déjà.")
+            slots.append(raw_text)
+            update_app_settings({"slots": slots})
+            set_settings_action(context, None)
+            await update.message.reply_text("✅ Créneau ajouté.", reply_markup=settings_slots_kb())
+            return SETTINGS_MENU
+
+        if action["type"] == "REDASH_URL":
+            update_app_settings({"redash_results_csv_url": raw_text})
+            set_settings_action(context, None)
+            await update.message.reply_text("✅ URL Redash mise à jour.", reply_markup=settings_redash_kb())
+            return SETTINGS_MENU
+
+        if action["type"] == "REDASH_API_KEY":
+            api_key = "" if raw_text.upper() == "VIDE" else raw_text
+            update_app_settings({"redash_api_key": api_key})
+            set_settings_action(context, None)
+            await update.message.reply_text("✅ API key Redash mise à jour.", reply_markup=settings_redash_kb())
+            return SETTINGS_MENU
+
+        if action["type"] == "RULE":
+            field = action["field"]
+            if field == "STATUS":
+                update_app_settings({"required_status": raw_text.lower()})
+            elif field == "DTYPE":
+                update_app_settings({"required_delivery_type": raw_text.lower()})
+            elif field == "MAXORDERS":
+                update_app_settings({"max_orders": parse_int_field(raw_text, "Le max commandes", minimum=1)})
+            else:
+                raise ValueError("Règle inconnue.")
+            set_settings_action(context, None)
+            await update.message.reply_text("✅ Règle mise à jour.", reply_markup=settings_rules_kb())
+            return SETTINGS_MENU
+
+        if action["type"] == "SLA":
+            value = parse_int_field(raw_text, "Le SLA", minimum=0)
+            field_map = {
+                "ACCEPT": "accept_max_min",
+                "PREP": "prep_max_min",
+                "LOAD": "load_max_min",
+                "DELIV": "deliv_max_min",
+            }
+            key = field_map.get(action["field"])
+            if not key:
+                raise ValueError("SLA inconnu.")
+            update_app_settings({key: value})
+            set_settings_action(context, None)
+            await update.message.reply_text("✅ SLA mis à jour.", reply_markup=settings_sla_kb())
+            return SETTINGS_MENU
+
+        raise ValueError("Action non supportée.")
+
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return SETTINGS_INPUT
 
 
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -839,14 +1608,10 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ensure_stores(context)
         stores = context.user_data.get(CTX_STORES, [])
         if not stores:
-            await q.edit_message_text("⚠️ Aucun magasin trouvé (stores_coords.csv).", reply_markup=main_menu_kb())
+            await q.edit_message_text("⚠️ Aucun magasin actif trouvé.", reply_markup=main_menu_kb())
             return ConversationHandler.END
 
-        buttons = [InlineKeyboardButton(s["store_name"], callback_data=f"STORE::{s['store_id']}") for s in stores]
-        kb = chunk_buttons(buttons, per_row=2)
-        kb.append([InlineKeyboardButton("Menu", callback_data="BACK_MENU")])
-
-        await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text("🏬 Choisis le magasin :", reply_markup=build_store_keyboard(stores))
         return CHOOSE_STORE
 
     # --------- Order module ----------
@@ -1086,7 +1851,7 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(CTX_SLOT, None)
 
     # Proposer les créneaux
-    btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
+    btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in configured_slots()]
     kb = chunk_buttons(btns, per_row=2)
     kb.append([InlineKeyboardButton("Retour dates", callback_data="BACK_DATES")])
 
@@ -1197,7 +1962,7 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
                 return ConversationHandler.END
 
-            btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in SLOTS_FIXED]
+            btns = [InlineKeyboardButton(s, callback_data=f"SLOT::{s}") for s in configured_slots()]
             kb = chunk_buttons(btns, per_row=2)
             kb.append([InlineKeyboardButton("Retour dates", callback_data="BACK_DATES")])
 
@@ -1329,6 +2094,25 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(msg, reply_markup=main_menu_kb())
         return ConversationHandler.END
 
+    store = find_store_by_name(store_name, active_only=False) or {
+        "store_id": store_name,
+        "store_name": store_name,
+        "lat": depot[0],
+        "lon": depot[1],
+        "capacity": 0,
+        "max_drivers": get_store_max_drivers(store_name),
+    }
+    text = format_route_plan_text(
+        build_route_plan(store, day_of_delivery, slot, num_drivers, rows=rows)
+    )
+
+    if edit_from_query:
+        await update.callback_query.edit_message_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+    else:
+        await update.message.reply_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+
+    return ConversationHandler.END
+
     routes_nodes = solve_vrp(depot, orders, num_drivers)
 
     lines = [
@@ -1385,6 +2169,8 @@ def build_telegram_app() -> Application:
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_cmd),
+            CommandHandler("settings", settings_cmd),
+            CommandHandler("whoami", whoami_cmd),
             CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH|CMD_MENU|STORE_MENU)$"),
         ],
         states={
@@ -1411,8 +2197,18 @@ def build_telegram_app() -> Application:
                 CallbackQueryHandler(on_menu_click, pattern="^STORE_MENU$"),
                 CallbackQueryHandler(on_store_menu_click, pattern="^(STORE::|STORE_MENU).*$"),
             ],
+            SETTINGS_MENU: [
+                CallbackQueryHandler(settings_menu_click, pattern="^SET::.*$"),
+            ],
+            SETTINGS_INPUT: [
+                CallbackQueryHandler(settings_menu_click, pattern="^SET::.*$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, settings_input_text),
+            ],
         },
-        fallbacks=[CommandHandler("start", start_cmd)],
+        fallbacks=[
+            CommandHandler("start", start_cmd),
+            CommandHandler("settings", settings_cmd),
+        ],
         allow_reentry=True,
     )
 
@@ -1421,10 +2217,61 @@ def build_telegram_app() -> Application:
     return application
 
 
+def admin_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if not session.get("admin_authenticated"):
+            return redirect(url_for("admin_login"))
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
+def parse_int_field(raw_value, label: str, minimum: Optional[int] = None) -> int:
+    try:
+        value = int(str(raw_value).strip())
+    except Exception as exc:
+        raise ValueError(f"{label} doit être un entier valide.") from exc
+
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{label} doit être supérieur ou égal à {minimum}.")
+    return value
+
+
+def parse_float_field(raw_value, label: str) -> float:
+    try:
+        return float(str(raw_value).strip())
+    except Exception as exc:
+        raise ValueError(f"{label} doit être un nombre valide.") from exc
+
+
+def parse_slots_text(raw_text: str) -> List[str]:
+    return [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
+
+
+def get_dates_for_store(store_id: str) -> List[str]:
+    store = get_store(store_id, active_only=True)
+    if not store:
+        return []
+    rows = parse_redash_rows(fetch_redash_csv_text())
+    return available_dates_for_store(rows, store["store_name"])
+
+
+def planner_state_defaults() -> Dict:
+    return {
+        "store_id": "",
+        "day_of_delivery": "",
+        "slot": "",
+        "num_drivers": 1,
+        "available_dates": [],
+    }
+
+
 # ============================================================
 # ✅ Render Webhook Bridge: Flask -> PTB.process_update
 # ============================================================
 flask_app = Flask(__name__)
+flask_app.secret_key = FLASK_SECRET_KEY
 
 ptb_app: Optional[Application] = None
 BOT_LOOP: Optional[asyncio.AbstractEventLoop] = None
@@ -1438,7 +2285,10 @@ STARTED = False
 def _ensure_bot_started():
     # ✅ IMPORTANT: Render port-scan hits "/" with GET/HEAD.
     # Do NOT block health checks by waiting for Telegram startup.
-    if request.path == "/" and request.method in ("GET", "HEAD"):
+    if request.path.startswith("/admin"):
+        return None
+
+    if request.method != "POST" or request.path not in ("/", "/webhook"):
         return None
 
     if not READY.is_set():
@@ -1447,6 +2297,253 @@ def _ensure_bot_started():
             start_background_bot(wait_ready=False)
         except Exception:
             log.exception("Failed to start PTB background thread")
+
+
+@flask_app.get("/admin")
+def admin_root():
+    if session.get("admin_authenticated"):
+        return redirect(url_for("admin_dashboard"))
+    return redirect(url_for("admin_login"))
+
+
+@flask_app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    if session.get("admin_authenticated"):
+        return redirect(url_for("admin_dashboard"))
+
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+
+        if username == ADMIN_USERNAME and check_password_hash(get_admin_password_hash(), password):
+            session["admin_authenticated"] = True
+            flash("Connexion réussie.", "success")
+            return redirect(url_for("admin_dashboard"))
+
+        flash("Identifiants invalides.", "error")
+
+    return render_template("login.html")
+
+
+@flask_app.post("/admin/logout")
+@admin_required
+def admin_logout():
+    session.clear()
+    flash("Session fermée.", "success")
+    return redirect(url_for("admin_login"))
+
+
+@flask_app.get("/admin/dashboard")
+@admin_required
+def admin_dashboard():
+    return render_template(
+        "dashboard.html",
+        stats=get_dashboard_stats(),
+        stores=list_stores(active_only=False),
+    )
+
+
+@flask_app.route("/admin/settings", methods=["GET", "POST"])
+@admin_required
+def admin_settings():
+    settings = runtime_settings()
+
+    if request.method == "POST":
+        try:
+            redash_results_csv_url = (request.form.get("redash_results_csv_url") or "").strip()
+            if not redash_results_csv_url:
+                raise ValueError("L'URL Redash est obligatoire.")
+
+            values = {
+                "redash_results_csv_url": redash_results_csv_url,
+                "redash_api_key": (request.form.get("redash_api_key") or "").strip(),
+                "max_orders": parse_int_field(request.form.get("max_orders"), "Le max commandes", minimum=1),
+                "required_status": (request.form.get("required_status") or "").strip().lower(),
+                "required_delivery_type": (request.form.get("required_delivery_type") or "").strip().lower(),
+                "accept_max_min": parse_int_field(request.form.get("accept_max_min"), "Le SLA acceptation", minimum=0),
+                "prep_max_min": parse_int_field(request.form.get("prep_max_min"), "Le SLA préparation", minimum=0),
+                "load_max_min": parse_int_field(request.form.get("load_max_min"), "Le SLA chargement", minimum=0),
+                "deliv_max_min": parse_int_field(request.form.get("deliv_max_min"), "Le SLA livraison", minimum=0),
+                "planner_time_limit_sec": parse_int_field(
+                    request.form.get("planner_time_limit_sec"),
+                    "Le temps solveur",
+                    minimum=1,
+                ),
+                "slots": parse_slots_text(request.form.get("slots") or ""),
+            }
+
+            if not values["slots"]:
+                raise ValueError("Ajoute au moins un créneau fixe.")
+
+            update_app_settings(values)
+            flash("Paramètres enregistrés.", "success")
+            return redirect(url_for("admin_settings"))
+        except ValueError as exc:
+            flash(str(exc), "error")
+            settings = {
+                "redash_results_csv_url": (request.form.get("redash_results_csv_url") or "").strip(),
+                "redash_api_key": (request.form.get("redash_api_key") or "").strip(),
+                "max_orders": request.form.get("max_orders") or "",
+                "required_status": (request.form.get("required_status") or "").strip().lower(),
+                "required_delivery_type": (request.form.get("required_delivery_type") or "").strip().lower(),
+                "accept_max_min": request.form.get("accept_max_min") or "",
+                "prep_max_min": request.form.get("prep_max_min") or "",
+                "load_max_min": request.form.get("load_max_min") or "",
+                "deliv_max_min": request.form.get("deliv_max_min") or "",
+                "planner_time_limit_sec": request.form.get("planner_time_limit_sec") or "",
+                "slots": parse_slots_text(request.form.get("slots") or ""),
+            }
+
+    return render_template("settings.html", settings=settings)
+
+
+@flask_app.get("/admin/stores")
+@admin_required
+def admin_stores():
+    return render_template("stores.html", stores=list_stores(active_only=False))
+
+
+@flask_app.route("/admin/stores/new", methods=["GET", "POST"])
+@admin_required
+def admin_store_new():
+    store = None
+
+    if request.method == "POST":
+        try:
+            store = {
+                "store_id": (request.form.get("store_id") or "").strip(),
+                "store_name": (request.form.get("store_name") or "").strip(),
+                "lat": request.form.get("lat") or "",
+                "lon": request.form.get("lon") or "",
+                "max_drivers": request.form.get("max_drivers") or 0,
+                "capacity": request.form.get("capacity") or 0,
+                "is_active": bool(request.form.get("is_active")),
+            }
+            save_store(
+                store_id=store["store_id"],
+                store_name=store["store_name"],
+                lat=parse_float_field(store["lat"], "La latitude"),
+                lon=parse_float_field(store["lon"], "La longitude"),
+                max_drivers=parse_int_field(store["max_drivers"], "Le max livreurs", minimum=0),
+                capacity=parse_int_field(store["capacity"], "La capacité", minimum=0),
+                is_active=store["is_active"],
+            )
+            flash("Magasin créé.", "success")
+            return redirect(url_for("admin_stores"))
+        except ValueError as exc:
+            flash(str(exc), "error")
+
+    return render_template("store_form.html", store=store)
+
+
+@flask_app.route("/admin/stores/<store_id>/edit", methods=["GET", "POST"])
+@admin_required
+def admin_store_edit(store_id: str):
+    store = get_store(store_id, active_only=False)
+    if not store:
+        flash("Magasin introuvable.", "error")
+        return redirect(url_for("admin_stores"))
+
+    if request.method == "POST":
+        try:
+            submitted = {
+                "store_id": (request.form.get("store_id") or "").strip(),
+                "store_name": (request.form.get("store_name") or "").strip(),
+                "lat": request.form.get("lat") or "",
+                "lon": request.form.get("lon") or "",
+                "max_drivers": request.form.get("max_drivers") or 0,
+                "capacity": request.form.get("capacity") or 0,
+                "is_active": bool(request.form.get("is_active")),
+            }
+            save_store(
+                store_id=submitted["store_id"],
+                store_name=submitted["store_name"],
+                lat=parse_float_field(submitted["lat"], "La latitude"),
+                lon=parse_float_field(submitted["lon"], "La longitude"),
+                max_drivers=parse_int_field(submitted["max_drivers"], "Le max livreurs", minimum=0),
+                capacity=parse_int_field(submitted["capacity"], "La capacité", minimum=0),
+                is_active=submitted["is_active"],
+                original_store_id=store_id,
+            )
+            flash("Magasin mis à jour.", "success")
+            return redirect(url_for("admin_stores"))
+        except ValueError as exc:
+            flash(str(exc), "error")
+            store = submitted
+
+    return render_template("store_form.html", store=store)
+
+
+@flask_app.post("/admin/stores/<store_id>/toggle")
+@admin_required
+def admin_store_toggle(store_id: str):
+    is_active = (request.form.get("is_active") or "0").strip() == "1"
+    set_store_active(store_id, is_active)
+    flash("Statut du magasin mis à jour.", "success")
+    return redirect(url_for("admin_stores"))
+
+
+@flask_app.route("/admin/planner", methods=["GET", "POST"])
+@admin_required
+def admin_planner():
+    settings = runtime_settings()
+    stores = list_stores(active_only=True)
+    planner = planner_state_defaults()
+    result = None
+
+    if request.method == "POST":
+        planner["store_id"] = (request.form.get("store_id") or "").strip()
+        planner["day_of_delivery"] = (request.form.get("day_of_delivery") or "").strip()
+        planner["slot"] = (request.form.get("slot") or "").strip()
+        planner["num_drivers"] = request.form.get("num_drivers") or 1
+        planner["available_dates"] = get_dates_for_store(planner["store_id"]) if planner["store_id"] else []
+
+        store = get_store(planner["store_id"], active_only=True)
+        if not store:
+            flash("Choisis un magasin actif.", "error")
+        elif not planner["day_of_delivery"]:
+            flash("Choisis une date.", "error")
+        elif not planner["slot"]:
+            flash("Choisis un créneau.", "error")
+        else:
+            try:
+                requested_drivers = parse_int_field(
+                    planner["num_drivers"],
+                    "Le nombre de livreurs",
+                    minimum=1,
+                )
+                rows = parse_redash_rows(fetch_redash_csv_text())
+                result = build_route_plan(
+                    store,
+                    planner["day_of_delivery"],
+                    planner["slot"],
+                    requested_drivers,
+                    rows=rows,
+                )
+                planner["num_drivers"] = requested_drivers
+                if result["order_count"] == 0:
+                    flash("Aucune commande trouvée pour cette sélection.", "warning")
+            except ValueError as exc:
+                flash(str(exc), "error")
+            except Exception as exc:
+                flash(f"Impossible de récupérer les données Redash: {exc}", "error")
+
+    return render_template(
+        "planner.html",
+        settings=settings,
+        stores=stores,
+        planner=planner,
+        result=result,
+    )
+
+
+@flask_app.get("/admin/api/stores/<store_id>/dates")
+@admin_required
+def admin_store_dates_api(store_id: str):
+    try:
+        return jsonify({"dates": get_dates_for_store(store_id)})
+    except Exception as exc:
+        return jsonify({"dates": [], "error": str(exc)}), 500
 
 
 @flask_app.get("/")
@@ -1528,12 +2625,13 @@ def _bot_thread():
     async def runner():
         global ptb_app
         ptb_app = build_telegram_app()
+        webhook_url = resolve_webhook_url()
 
         await ptb_app.initialize()
         await ptb_app.start()
 
         await ptb_app.bot.set_webhook(
-            url=WEBHOOK_URL,
+            url=webhook_url,
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
         )
@@ -1563,9 +2661,9 @@ def start_background_bot(wait_ready: bool = False):
         STARTED = True
 
         if not TELEGRAM_TOKEN:
-            raise RuntimeError("Missing TELEGRAM_TOKEN env var")
-        if not WEBHOOK_URL:
-            raise RuntimeError("Missing WEBHOOK_URL env var (ex: https://xxx.onrender.com/webhook)")
+            raise RuntimeError("Missing TELEGRAM_TOKEN or BOT_TOKEN env var")
+        if not resolve_webhook_url():
+            raise RuntimeError("Missing WEBHOOK_URL or RENDER_EXTERNAL_URL")
 
         t = threading.Thread(target=_bot_thread, daemon=True)
         t.start()
@@ -1584,7 +2682,10 @@ def _on_exit():
 atexit.register(_on_exit)
 
 if __name__ == "__main__":
-    start_background_bot(wait_ready=True)
+    if TELEGRAM_TOKEN and resolve_webhook_url():
+        start_background_bot(wait_ready=True)
+    else:
+        log.warning("Telegram worker not started. Configure TELEGRAM_TOKEN/BOT_TOKEN and WEBHOOK_URL or rely on RENDER_EXTERNAL_URL.")
     print("Local: gunicorn bot:flask_app --bind 0.0.0.0:10000 --workers 1 --threads 8")
 
 
