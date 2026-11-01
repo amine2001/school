@@ -28,6 +28,10 @@
         <span>Temps max du solveur OR-Tools (secondes)</span>
         <input type="number" name="planner_time_limit_sec" value="{{ settings.planner_time_limit_sec }}" min="1" required>
       </label>
+      <label class="toggle">
+        <input type="checkbox" name="return_to_depot" value="1" {% if settings.return_to_depot %}checked{% endif %}>
+        <span>Retour au magasin en fin de tournée</span>
+      </label>
     </section>
 
     <section class="panel">

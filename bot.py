@@ -737,6 +737,7 @@ def solve_vrp(
     orders: List[Tuple[str, float, float]],
     num_vehicles: int,
     time_limit_seconds: Optional[int] = None,
+    return_to_depot: Optional[bool] = None,
 ) -> List[List[int]]:
     """
     VRP tuned to:
@@ -748,6 +749,9 @@ def solve_vrp(
     if num_vehicles <= 0:
         return []
 
+    if return_to_depot is None:
+        return_to_depot = bool(runtime_settings().get("return_to_depot", False))
+
     points = [depot] + [(lat, lon) for (_, lat, lon) in orders]
     dist = build_distance_matrix(points)
 
@@ -758,6 +762,9 @@ def solve_vrp(
     def dist_cb(from_index, to_index):
         i = manager.IndexToNode(from_index)
         j = manager.IndexToNode(to_index)
+        # Open route: the way back to the store is free.
+        if not return_to_depot and j == 0:
+            return 0
         return dist[i][j]
 
     transit_idx = routing.RegisterTransitCallback(dist_cb)
@@ -1012,10 +1019,15 @@ def settings_redash_kb() -> InlineKeyboardMarkup:
 
 
 def settings_rules_kb() -> InlineKeyboardMarkup:
+    return_to_depot = runtime_settings().get("return_to_depot", False)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Status requis", callback_data="SET::RULE::STATUS")],
         [InlineKeyboardButton("Delivery Type requis", callback_data="SET::RULE::DTYPE")],
         [InlineKeyboardButton("Max commandes", callback_data="SET::RULE::MAXORDERS")],
+        [InlineKeyboardButton(
+            f"Retour magasin : {'Oui' if return_to_depot else 'Non'}",
+            callback_data="SET::RULETOGGLE::RETURN",
+        )],
         [InlineKeyboardButton("Retour", callback_data="SET::ROOT")],
     ])
 
@@ -1041,6 +1053,17 @@ def format_store_settings(store: Dict) -> str:
     ])
 
 
+def format_rules_settings(settings: Dict) -> str:
+    return "\n".join([
+        "📋 Règles métier",
+        "",
+        f"Status requis: {settings['required_status'] or '-'}",
+        f"Delivery Type requis: {settings['required_delivery_type'] or '-'}",
+        f"Max commandes: {settings['max_orders']}",
+        f"Retour magasin: {'Oui' if settings.get('return_to_depot') else 'Non'}",
+    ])
+
+
 def format_settings_info() -> str:
     settings = runtime_settings()
     stats = get_dashboard_stats()
@@ -1054,6 +1077,7 @@ def format_settings_info() -> str:
         f"Status requis: {settings['required_status'] or '-'}",
         f"Delivery Type requis: {settings['required_delivery_type'] or '-'}",
         f"Temps solveur: {settings['planner_time_limit_sec']}s",
+        f"Retour magasin: {'Oui' if settings.get('return_to_depot') else 'Non'}",
         f"Redash API key: {mask_secret(settings['redash_api_key'])}",
     ])
 
@@ -1520,14 +1544,13 @@ async def settings_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data == "SET::SEC::RULES":
         set_settings_action(context, None)
+        await q.edit_message_text(format_rules_settings(settings), reply_markup=settings_rules_kb())
+        return SETTINGS_MENU
+
+    if data == "SET::RULETOGGLE::RETURN":
+        update_app_settings({"return_to_depot": not settings.get("return_to_depot", False)})
         await q.edit_message_text(
-            "\n".join([
-                "📋 Règles métier",
-                "",
-                f"Status requis: {settings['required_status'] or '-'}",
-                f"Delivery Type requis: {settings['required_delivery_type'] or '-'}",
-                f"Max commandes: {settings['max_orders']}",
-            ]),
+            "✅ Règle mise à jour.\n\n" + format_rules_settings(runtime_settings()),
             reply_markup=settings_rules_kb(),
         )
         return SETTINGS_MENU
@@ -2265,43 +2288,6 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
 
     return ConversationHandler.END
 
-    routes_nodes = solve_vrp(depot, orders, num_drivers)
-
-    lines = [
-        f"📍 Magasin: {store_name}",
-        f"📅 Date: {day_of_delivery}",
-        f"🕒 Créneau: {slot}",
-        f"📦 Commandes (new/planned): {len(orders)}",
-        f"🚴 Livreurs: {num_drivers}",
-        "",
-    ]
-
-    for v in range(num_drivers):
-        stops_nodes = routes_nodes[v]
-        if not stops_nodes:
-            lines += [f"👤 Livreur {v + 1}: 0 commande", "—"]
-            continue
-
-        stop_orders = [orders[node - 1] for node in stops_nodes]
-        ids = [o[0] for o in stop_orders]
-        latlons = [(o[1], o[2]) for o in stop_orders]
-        gmap = google_maps_link(depot, latlons)
-
-        lines.append(f"👤 Livreur {v + 1}: {len(ids)} commandes")
-        lines.append("🧾 " + " → ".join(ids))
-        if gmap:
-            lines.append("🗺️ " + gmap)
-        lines.append("—")
-
-    text = "\n".join(lines)
-
-    if edit_from_query:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
-    else:
-        await update.message.reply_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
-
-    return ConversationHandler.END
-
 
 # ============================
 # Error handler
@@ -2521,6 +2507,7 @@ def admin_settings():
                     "Le temps solveur",
                     minimum=1,
                 ),
+                "return_to_depot": bool(request.form.get("return_to_depot")),
                 "slots": parse_slots_text(request.form.get("slots") or ""),
             }
 
@@ -2543,6 +2530,7 @@ def admin_settings():
                 "load_max_min": request.form.get("load_max_min") or "",
                 "deliv_max_min": request.form.get("deliv_max_min") or "",
                 "planner_time_limit_sec": request.form.get("planner_time_limit_sec") or "",
+                "return_to_depot": bool(request.form.get("return_to_depot")),
                 "slots": parse_slots_text(request.form.get("slots") or ""),
             }
 

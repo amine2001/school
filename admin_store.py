@@ -51,6 +51,7 @@ DEFAULT_SETTINGS = {
     "load_max_min": os.getenv("LOAD_MAX_MIN", "20").strip(),
     "deliv_max_min": os.getenv("DELIV_MAX_MIN", "120").strip(),
     "planner_time_limit_sec": os.getenv("PLANNER_TIME_LIMIT_SEC", "12").strip(),
+    "return_to_depot": os.getenv("RETURN_TO_DEPOT", "0").strip(),
     "slots_json": json.dumps(DEFAULT_SLOTS, ensure_ascii=False),
 }
 
@@ -222,6 +223,17 @@ def _to_int(value, fallback: int) -> int:
         return int(str(value).strip())
     except Exception:
         return fallback
+
+
+def _to_bool(value, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value if value is not None else "").strip().lower()
+    if text in ("1", "true", "yes", "oui", "on"):
+        return True
+    if text in ("0", "false", "no", "non", "off"):
+        return False
+    return fallback
 
 
 def _row_to_store(row: sqlite3.Row) -> Dict:
@@ -414,6 +426,7 @@ def get_app_settings() -> Dict:
             1,
             _to_int(merged.get("planner_time_limit_sec"), 12),
         ),
+        "return_to_depot": _to_bool(merged.get("return_to_depot"), False),
         "slots": slots,
     }
 
@@ -444,7 +457,7 @@ def update_app_settings(values: Dict[str, object]) -> None:
                 VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
                 """,
-                (key, str(value), now),
+                (key, ("1" if value else "0") if isinstance(value, bool) else str(value), now),
             )
 
 
