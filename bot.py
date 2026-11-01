@@ -1068,7 +1068,7 @@ def format_settings_info() -> str:
     settings = runtime_settings()
     stats = get_dashboard_stats()
     return "\n".join([
-        "⚙️ Bringo Routes Optimizer V2",
+        "⚙️ Bringo Routes Optimizer V3",
         "",
         f"Admins Telegram: {admin_ids_text()}",
         f"Magasins actifs: {stats['stores_active']}/{stats['stores_total']}",

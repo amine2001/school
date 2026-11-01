@@ -1,6 +1,6 @@
-# Bringo Routes Optimizer V2
+# Bringo Routes Optimizer V3
 
-Bringo Routes Optimizer V2 is a Telegram bot for route planning and store operations.
+Bringo Routes Optimizer V3 is a Telegram bot for route planning and store operations.
 
 It keeps the original planning features and adds a persistent admin system directly inside Telegram through `/settings`.
 
