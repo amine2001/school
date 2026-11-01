@@ -837,6 +837,23 @@ def solve_vrp(
 
 
 
+def route_distance_km(
+    depot: Tuple[float, float],
+    stops_latlon: List[Tuple[float, float]],
+    return_to_depot: bool = False,
+) -> float:
+    if not stops_latlon:
+        return 0.0
+    points = [depot] + list(stops_latlon)
+    if return_to_depot:
+        points.append(depot)
+    total_m = sum(
+        haversine_m(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1])
+        for i in range(len(points) - 1)
+    )
+    return total_m / 1000.0
+
+
 def google_maps_link(depot: Tuple[float, float], stops_latlon: List[Tuple[float, float]]) -> str:
     if not stops_latlon:
         return ""
@@ -1213,7 +1230,12 @@ def build_route_plan(
     else:
         selected_drivers = min(selected_drivers, allowed_max)
 
-    routes_nodes = solve_vrp(depot, orders, selected_drivers) if orders and selected_drivers > 0 else []
+    return_to_depot = bool(runtime_settings().get("return_to_depot", False))
+    routes_nodes = (
+        solve_vrp(depot, orders, selected_drivers, return_to_depot=return_to_depot)
+        if orders and selected_drivers > 0
+        else []
+    )
     capacity = int(store.get("capacity") or 0)
 
     routes = []
@@ -1227,6 +1249,7 @@ def build_route_plan(
                 "driver_number": index + 1,
                 "order_count": len(order_ids),
                 "order_ids": order_ids,
+                "distance_km": round(route_distance_km(depot, latlons, return_to_depot), 1),
                 "map_url": google_maps_link(depot, latlons) if order_ids else "",
             }
         )
@@ -1271,7 +1294,10 @@ def format_route_plan_text(result: Dict) -> str:
             lines += [f"👤 Livreur {route['driver_number']}: 0 commande", "—"]
             continue
 
-        lines.append(f"👤 Livreur {route['driver_number']}: {route['order_count']} commandes")
+        lines.append(
+            f"👤 Livreur {route['driver_number']}: {route['order_count']} commandes"
+            f" · {route.get('distance_km', 0):.1f} km"
+        )
         lines.append("🧾 " + " → ".join(route["order_ids"]))
         if route["map_url"]:
             lines.append("🗺️ " + route["map_url"])
