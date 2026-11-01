@@ -1291,7 +1291,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_admin_update(update):
             extra = "\nAdmin: utilise /settings pour modifier la configuration globale."
         await update.message.reply_text(
-            "Bringo Routes Optimizer V2 ✅\nChoisis une action :" + extra,
+            "Bringo Routes Optimizer V3🔥\nChoisis une action :" + extra,
             reply_markup=main_menu_kb(),
         )
         return
