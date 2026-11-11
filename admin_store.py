@@ -170,6 +170,15 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_km_store_day ON driver_km_log(store_id, day)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS planning_settings (
+                store_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT
+            )
+            """
+        )
         _seed_settings(conn)
         _seed_stores(conn)
 
@@ -587,3 +596,23 @@ def save_slot_km(store_id: str, day: str, slot: str, entries: List[Dict]) -> Non
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (store_id, entry["name"], day, slot, float(entry["km"]), int(entry.get("orders") or 0), now),
             )
+
+
+def is_planning_enabled(store_id: str) -> bool:
+    """Bouton 'Selon planning' affiché pour ce magasin ? (activé par défaut)"""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT enabled FROM planning_settings WHERE store_id = ?", (store_id,)
+        ).fetchone()
+    return True if row is None else bool(row["enabled"])
+
+
+def set_planning_enabled(store_id: str, enabled: bool) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO planning_settings(store_id, enabled, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(store_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at
+            """,
+            (store_id, 1 if enabled else 0, utcnow_iso()),
+        )

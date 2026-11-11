@@ -48,6 +48,8 @@ from admin_store import (
     get_driver_km_totals,
     get_store,
     get_store_schedule,
+    is_planning_enabled,
+    set_planning_enabled,
     replace_store_schedule,
     save_slot_km,
     init_db,
@@ -177,6 +179,7 @@ CTX_SETTINGS_ACTION = "settings_action"
 CTX_SETTINGS_STORE_ID = "settings_store_id"
 CTX_USE_PLANNING = "use_planning"
 CTX_PENDING_KM = "pending_km"
+CTX_LAST_PLAN_TEXT = "last_plan_text"
 
 STORE_WIZARD_FIELDS = (
     "store_id",
@@ -1086,7 +1089,13 @@ def settings_planning_stores_kb() -> InlineKeyboardMarkup:
 
 
 def settings_planning_store_kb(store_id: str) -> InlineKeyboardMarkup:
+    toggle_label = (
+        "Bouton Selon planning : Activé ✅ (cliquer pour désactiver)"
+        if is_planning_enabled(store_id)
+        else "Bouton Selon planning : Désactivé ❌ (cliquer pour activer)"
+    )
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data=f"SET::PLANTOGGLE::{store_id}")],
         [InlineKeyboardButton("📤 Importer Excel", callback_data=f"SET::PLANUP::{store_id}")],
         [InlineKeyboardButton("Retour", callback_data="SET::SEC::PLANNING")],
     ])
@@ -1711,6 +1720,18 @@ async def settings_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return SETTINGS_MENU
 
+    if data.startswith("SET::PLANTOGGLE::"):
+        store = get_store(data.split("::", 2)[2])
+        if not store:
+            await q.edit_message_text("Magasin introuvable.", reply_markup=settings_planning_stores_kb())
+            return SETTINGS_MENU
+        set_planning_enabled(store["store_id"], not is_planning_enabled(store["store_id"]))
+        await q.edit_message_text(
+            format_planning_store_text(store),
+            reply_markup=settings_planning_store_kb(store["store_id"]),
+        )
+        return SETTINGS_MENU
+
     if data.startswith("SET::PLANUP::"):
         store = get_store(data.split("::", 2)[2])
         if not store:
@@ -2281,7 +2302,9 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, allowed_max + 1)]
     kb = chunk_buttons(btns, per_row=5)
-    kb.append([InlineKeyboardButton("Selon planning", callback_data="DRV::PLAN")])
+    plan_store = find_store_by_name(store_name, active_only=False)
+    if plan_store and is_planning_enabled(plan_store["store_id"]):
+        kb.append([InlineKeyboardButton("Selon planning", callback_data="DRV::PLAN")])
     kb.append([InlineKeyboardButton("Saisir un nombre", callback_data="DRV::TEXT")])
     kb.append([InlineKeyboardButton("Retour créneaux", callback_data="BACK_SLOTS")])
 
@@ -2408,20 +2431,58 @@ async def choose_drivers_from_planning(update: Update, context: ContextTypes.DEF
     return await run_planning_and_send(update, context, edit_from_query=True)
 
 
+def plan_result_kb(with_validate: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if with_validate:
+        rows.append([InlineKeyboardButton("✅ Valider (enregistrer les km)", callback_data="PLAN::OK")])
+    rows.append([InlineKeyboardButton("📋 Copier le message", callback_data="PLAN::COPY")])
+    return InlineKeyboardMarkup(rows + list(main_menu_kb().inline_keyboard))
+
+
+async def plan_copy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Renvoie le message du trajet dans un bloc code : un appui dessus copie tout le texte."""
+    q = update.callback_query
+    await safe_answer(q)
+    text = context.user_data.get(CTX_LAST_PLAN_TEXT) or (q.message.text if q.message else "")
+    if not text:
+        await q.message.reply_text("Aucun trajet à copier.", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    import html as _html
+
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > 3500:
+            chunks.append(current)
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current)
+
+    for chunk in chunks:
+        await q.message.reply_text(
+            "<pre>" + _html.escape(chunk.rstrip("\n")) + "</pre>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    await q.message.reply_text("👆 Appuie sur le bloc pour copier tout le message.", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+
 async def plan_validate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bouton 'Valider' : enregistre les km du créneau pour l'équité."""
     q = update.callback_query
     await safe_answer(q)
     pending = context.user_data.pop(CTX_PENDING_KM, None)
     if not pending:
-        await q.edit_message_reply_markup(reply_markup=main_menu_kb())
+        await q.edit_message_reply_markup(reply_markup=plan_result_kb())
         return ConversationHandler.END
 
     save_slot_km(pending["store_id"], pending["day"], pending["slot"], pending["entries"])
     total = sum(e["km"] for e in pending["entries"])
     text = (q.message.text or "") + f"\n\n✅ Km enregistrés ({total:.1f} km au total). Équité mise à jour."
     try:
-        await q.edit_message_text(text[:4096], reply_markup=main_menu_kb(), disable_web_page_preview=True)
+        await q.edit_message_text(text[:4096], reply_markup=plan_result_kb(), disable_web_page_preview=True)
     except BadRequest:
         await q.message.reply_text("✅ Km enregistrés. Équité mise à jour.", reply_markup=main_menu_kb())
     return ConversationHandler.END
@@ -2519,7 +2580,7 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
         "max_drivers": get_store_max_drivers(store_name),
     }
     result = build_route_plan(store, day_of_delivery, slot, num_drivers, rows=rows)
-    reply_kb = main_menu_kb()
+    reply_kb = plan_result_kb()
     context.user_data.pop(CTX_PENDING_KM, None)
 
     if context.user_data.get(CTX_USE_PLANNING) and store.get("id"):
@@ -2539,14 +2600,12 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
                         if r["driver_name"]
                     ],
                 }
-                reply_kb = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("✅ Valider (enregistrer les km)", callback_data="PLAN::OK")]]
-                    + list(main_menu_kb().inline_keyboard)
-                )
+                reply_kb = plan_result_kb(with_validate=True)
 
     text = format_route_plan_text(result)
     if len(text) > 4096:
         text = text[:4000] + "\n…(message tronqué)"
+    context.user_data[CTX_LAST_PLAN_TEXT] = text
 
     if edit_from_query:
         await update.callback_query.edit_message_text(text, reply_markup=reply_kb, disable_web_page_preview=True)
@@ -2578,6 +2637,7 @@ def build_telegram_app() -> Application:
             CommandHandler("whoami", whoami_cmd),
             CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH|CMD_MENU|STORE_MENU)$"),
             CallbackQueryHandler(plan_validate, pattern="^PLAN::OK$"),
+            CallbackQueryHandler(plan_copy, pattern="^PLAN::COPY$"),
         ],
         states={
             CHOOSE_STORE: [
