@@ -45,12 +45,25 @@ from admin_store import (
     find_store_by_name,
     get_app_settings,
     get_dashboard_stats,
+    get_driver_km_totals,
     get_store,
+    get_store_schedule,
+    replace_store_schedule,
+    save_slot_km,
     init_db,
     list_stores,
     save_store,
     set_store_active,
     update_app_settings,
+)
+from planning import (
+    DAY_NAMES_FR,
+    assign_routes_fairly,
+    format_schedule_text,
+    parse_delivery_date,
+    parse_schedule_csv,
+    parse_schedule_xlsx,
+    split_present_off,
 )
 
 # ============================
@@ -162,6 +175,8 @@ CTX_NUM_DRIVERS = "num_drivers"
 CTX_MAX_DRIVERS_ALLOWED = "max_drivers_allowed"
 CTX_SETTINGS_ACTION = "settings_action"
 CTX_SETTINGS_STORE_ID = "settings_store_id"
+CTX_USE_PLANNING = "use_planning"
+CTX_PENDING_KM = "pending_km"
 
 STORE_WIZARD_FIELDS = (
     "store_id",
@@ -982,6 +997,7 @@ def settings_main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Redash", callback_data="SET::SEC::REDASH")],
         [InlineKeyboardButton("Règles", callback_data="SET::SEC::RULES")],
         [InlineKeyboardButton("SLA", callback_data="SET::SEC::SLA")],
+        [InlineKeyboardButton("Planning livreurs", callback_data="SET::SEC::PLANNING")],
         [InlineKeyboardButton("Infos", callback_data="SET::SEC::INFO")],
         [InlineKeyboardButton("Fermer", callback_data="SET::CLOSE")],
     ])
@@ -1057,6 +1073,35 @@ def settings_sla_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Livraison", callback_data="SET::SLA::DELIV")],
         [InlineKeyboardButton("Retour", callback_data="SET::ROOT")],
     ])
+
+
+def settings_planning_stores_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for store in list_stores(active_only=False):
+        count = len(get_store_schedule(store["store_id"]))
+        label = f"{store['store_name']} ({count} livreurs)" if count else f"{store['store_name']} (vide)"
+        rows.append([InlineKeyboardButton(label, callback_data=f"SET::PLANSTORE::{store['store_id']}")])
+    rows.append([InlineKeyboardButton("Retour", callback_data="SET::ROOT")])
+    return InlineKeyboardMarkup(rows)
+
+
+def settings_planning_store_kb(store_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Importer Excel", callback_data=f"SET::PLANUP::{store_id}")],
+        [InlineKeyboardButton("Retour", callback_data="SET::SEC::PLANNING")],
+    ])
+
+
+def format_planning_store_text(store: Dict) -> str:
+    schedule = get_store_schedule(store["store_id"])
+    text = format_schedule_text(store["store_name"], schedule)
+    today = datetime.date.today()
+    totals = get_driver_km_totals(store["store_id"], today.isoformat(), today.isoformat())
+    if schedule:
+        text += f"\n\n📏 Km validés aujourd'hui ({today.strftime('%d/%m/%Y')}) :"
+        for name in sorted((d["name"] for d in schedule), key=lambda n: totals.get(n, 0.0)):
+            text += f"\n• {name} : {totals.get(name, 0.0):.1f} km"
+    return text
 
 
 def format_store_settings(store: Dict) -> str:
@@ -1279,23 +1324,50 @@ def build_route_plan(
     }
 
 
+def apply_planning_to_plan(result: Dict, store: Dict, present: List[str], off: List[str], delivery_date) -> Dict:
+    """Remplace 'Livreur 1, 2...' par les noms du planning, en respectant l'équité des km du mois."""
+    day_iso = delivery_date.isoformat()
+    # Équité sur la journée uniquement : seuls les créneaux validés du même jour comptent.
+    cumul = get_driver_km_totals(
+        store["store_id"], day_iso, day_iso, exclude_slot=(day_iso, result["slot"])
+    )
+    routes = result["routes"]
+    names = assign_routes_fairly([r["distance_km"] for r in routes], present, cumul)
+    for route, name in zip(routes, names):
+        route["driver_name"] = name
+        route["cumul_km"] = round(cumul.get(name, 0.0), 1)
+    used = set(names)
+    result["planning"] = {
+        "weekday": DAY_NAMES_FR[delivery_date.weekday()],
+        "present": present,
+        "off": off,
+        "reserve": [n for n in present if n not in used],
+        "day_iso": day_iso,
+    }
+    return result
+
+
 def format_route_plan_text(result: Dict) -> str:
+    planning = result.get("planning")
     lines = [
         f"📍 Magasin: {result['store_name']}",
         f"📅 Date: {result['day_of_delivery']}",
         f"🕒 Créneau: {result['slot']}",
         f"📦 Commandes: {result['order_count']}",
         f"🚴 Livreurs: {result['num_drivers']}",
-        "",
     ]
+    if planning and planning["reserve"]:
+        lines.append("🔁 Réserve (non utilisés): " + ", ".join(planning["reserve"]))
+    lines.append("")
 
     for route in result["routes"]:
+        label = route.get("driver_name") or f"Livreur {route['driver_number']}"
         if not route["order_ids"]:
-            lines += [f"👤 Livreur {route['driver_number']}: 0 commande", "—"]
+            lines += [f"👤 {label}: 0 commande", "—"]
             continue
 
         lines.append(
-            f"👤 Livreur {route['driver_number']}: {route['order_count']} commandes"
+            f"👤 {label}: {route['order_count']} commandes"
             f" · {route.get('distance_km', 0):.1f} km"
         )
         lines.append("🧾 " + " → ".join(route["order_ids"]))
@@ -1625,6 +1697,40 @@ async def settings_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return SETTINGS_INPUT
 
+    if data == "SET::SEC::PLANNING":
+        set_settings_action(context, None)
+        await q.edit_message_text(
+            "📅 Planning livreurs\nChoisis un magasin :",
+            reply_markup=settings_planning_stores_kb(),
+        )
+        return SETTINGS_MENU
+
+    if data.startswith("SET::PLANSTORE::"):
+        set_settings_action(context, None)
+        store = get_store(data.split("::", 2)[2])
+        if not store:
+            await q.edit_message_text("Magasin introuvable.", reply_markup=settings_planning_stores_kb())
+            return SETTINGS_MENU
+        await q.edit_message_text(
+            format_planning_store_text(store),
+            reply_markup=settings_planning_store_kb(store["store_id"]),
+        )
+        return SETTINGS_MENU
+
+    if data.startswith("SET::PLANUP::"):
+        store = get_store(data.split("::", 2)[2])
+        if not store:
+            await q.edit_message_text("Magasin introuvable.", reply_markup=settings_planning_stores_kb())
+            return SETTINGS_MENU
+        set_settings_action(context, {"type": "PLANNING_UPLOAD", "store_id": store["store_id"]})
+        await q.edit_message_text(
+            f"📤 Envoie le fichier Excel (.xlsx) du planning de {store['store_name']}.\n\n"
+            "Format : 1ère ligne = LUNDI … DIMANCHE, 1ère colonne = noms des livreurs, "
+            "X = travaille, OFF = repos.\nL'ancien planning de ce magasin sera remplacé.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Retour", callback_data=f"SET::PLANSTORE::{store['store_id']}")]]),
+        )
+        return SETTINGS_INPUT
+
     if data == "SET::SEC::INFO":
         set_settings_action(context, None)
         await q.edit_message_text(
@@ -1636,6 +1742,46 @@ async def settings_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     await q.edit_message_text(
         "⚙️ Paramètres admin\nChoisis une section à modifier :",
         reply_markup=settings_main_kb(),
+    )
+    return SETTINGS_MENU
+
+
+async def settings_input_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Réception du fichier Excel/CSV de planning."""
+    if not is_admin_update(update):
+        await deny_settings_access(update)
+        return ConversationHandler.END
+
+    action = get_settings_action(context)
+    if not action or action.get("type") != "PLANNING_UPLOAD":
+        await update.message.reply_text("Utilise /settings → Planning livreurs → Importer Excel.")
+        return SETTINGS_INPUT
+
+    store = get_store(action["store_id"])
+    doc = update.message.document
+    filename = (doc.file_name or "").lower()
+    try:
+        tg_file = await doc.get_file()
+        content = bytes(await tg_file.download_as_bytearray())
+        if filename.endswith(".csv"):
+            drivers = parse_schedule_csv(content)
+        elif filename.endswith((".xlsx", ".xlsm")):
+            drivers = parse_schedule_xlsx(content)
+        else:
+            raise ValueError("Format non supporté. Envoie un fichier .xlsx (ou .csv).")
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return SETTINGS_INPUT
+    except Exception as exc:
+        log.exception("Planning import failed")
+        await update.message.reply_text(f"❌ Lecture du fichier impossible : {exc}")
+        return SETTINGS_INPUT
+
+    replace_store_schedule(store["store_id"], drivers)
+    set_settings_action(context, None)
+    await update.message.reply_text(
+        "✅ Planning importé.\n\n" + format_planning_store_text(store),
+        reply_markup=settings_planning_store_kb(store["store_id"]),
     )
     return SETTINGS_MENU
 
@@ -2141,6 +2287,7 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, allowed_max + 1)]
     kb = chunk_buttons(btns, per_row=5)
+    kb.append([InlineKeyboardButton("📅 Selon planning", callback_data="DRV::PLAN")])
     kb.append([InlineKeyboardButton("Saisir un nombre", callback_data="DRV::TEXT")])
     kb.append([InlineKeyboardButton("Retour créneaux", callback_data="BACK_SLOTS")])
 
@@ -2178,7 +2325,15 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["awaiting_drivers_text"] = True
             return CHOOSE_DRIVERS
 
+        if q.data == "BACK_MENU":
+            await q.edit_message_text("Menu :", reply_markup=main_menu_kb())
+            return ConversationHandler.END
+
+        if q.data == "DRV::PLAN":
+            return await choose_drivers_from_planning(update, context)
+
         if q.data.startswith("DRV::"):
+            context.user_data[CTX_USE_PLANNING] = False
             try:
                 n = int(q.data.split("::", 1)[1])
             except Exception:
@@ -2213,6 +2368,71 @@ async def choose_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSE_DRIVERS
 
 
+def _planning_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Retour créneaux", callback_data="BACK_SLOTS")],
+        [InlineKeyboardButton("Menu", callback_data="BACK_MENU")],
+    ])
+
+
+async def choose_drivers_from_planning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bouton 'Selon planning' : livreurs présents ce jour-là, km répartis équitablement."""
+    q = update.callback_query
+    store_name = context.user_data.get(CTX_STORE_NAME, "")
+    day = context.user_data.get(CTX_DATE, "")
+    store = find_store_by_name(store_name, active_only=False)
+    delivery_date = parse_delivery_date(day)
+
+    if not store or not delivery_date:
+        await q.edit_message_text(
+            f"❌ Impossible de lire le magasin ou la date ({day}).", reply_markup=_planning_back_kb()
+        )
+        return CHOOSE_DRIVERS
+
+    schedule = get_store_schedule(store["store_id"])
+    if not schedule:
+        await q.edit_message_text(
+            f"⚠️ Aucun planning importé pour {store_name}.\n"
+            "Admin : /settings → Planning livreurs → Importer Excel.",
+            reply_markup=_planning_back_kb(),
+        )
+        return CHOOSE_DRIVERS
+
+    present, _off = split_present_off(schedule, delivery_date.weekday())
+    if not present:
+        await q.edit_message_text(
+            f"⚠️ Personne ne travaille le {DAY_NAMES_FR[delivery_date.weekday()]} selon le planning de {store_name}.",
+            reply_markup=_planning_back_kb(),
+        )
+        return CHOOSE_DRIVERS
+
+    allowed_max = int(context.user_data.get(CTX_MAX_DRIVERS_ALLOWED) or 0)
+    n = min(len(present), allowed_max) if allowed_max > 0 else len(present)
+    context.user_data[CTX_NUM_DRIVERS] = max(1, n)
+    context.user_data[CTX_USE_PLANNING] = True
+    await q.edit_message_text(f"⏳ Calcul selon planning ({n} livreurs présents)...")
+    return await run_planning_and_send(update, context, edit_from_query=True)
+
+
+async def plan_validate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bouton 'Valider' : enregistre les km du créneau pour l'équité."""
+    q = update.callback_query
+    await safe_answer(q)
+    pending = context.user_data.pop(CTX_PENDING_KM, None)
+    if not pending:
+        await q.edit_message_reply_markup(reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    save_slot_km(pending["store_id"], pending["day"], pending["slot"], pending["entries"])
+    total = sum(e["km"] for e in pending["entries"])
+    text = (q.message.text or "") + f"\n\n✅ Km enregistrés ({total:.1f} km au total). Équité mise à jour."
+    try:
+        await q.edit_message_text(text[:4096], reply_markup=main_menu_kb(), disable_web_page_preview=True)
+    except BadRequest:
+        await q.message.reply_text("✅ Km enregistrés. Équité mise à jour.", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+
 async def drivers_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("awaiting_drivers_text"):
         return
@@ -2242,6 +2462,7 @@ async def drivers_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["awaiting_drivers_text"] = False
+    context.user_data[CTX_USE_PLANNING] = False
     context.user_data[CTX_NUM_DRIVERS] = n
     return await run_planning_and_send(update, context, edit_from_query=False)
 
@@ -2303,14 +2524,40 @@ async def run_planning_and_send(update: Update, context: ContextTypes.DEFAULT_TY
         "capacity": 0,
         "max_drivers": get_store_max_drivers(store_name),
     }
-    text = format_route_plan_text(
-        build_route_plan(store, day_of_delivery, slot, num_drivers, rows=rows)
-    )
+    result = build_route_plan(store, day_of_delivery, slot, num_drivers, rows=rows)
+    reply_kb = main_menu_kb()
+    context.user_data.pop(CTX_PENDING_KM, None)
+
+    if context.user_data.get(CTX_USE_PLANNING) and store.get("id"):
+        delivery_date = parse_delivery_date(day_of_delivery)
+        schedule = get_store_schedule(store["store_id"])
+        if delivery_date and schedule:
+            present, off = split_present_off(schedule, delivery_date.weekday())
+            if len(present) >= len(result["routes"]):
+                apply_planning_to_plan(result, store, present, off, delivery_date)
+                context.user_data[CTX_PENDING_KM] = {
+                    "store_id": store["store_id"],
+                    "day": delivery_date.isoformat(),
+                    "slot": slot,
+                    "entries": [
+                        {"name": r["driver_name"], "km": r["distance_km"], "orders": r["order_count"]}
+                        for r in result["routes"]
+                        if r["driver_name"]
+                    ],
+                }
+                reply_kb = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("✅ Valider (enregistrer les km)", callback_data="PLAN::OK")]]
+                    + list(main_menu_kb().inline_keyboard)
+                )
+
+    text = format_route_plan_text(result)
+    if len(text) > 4096:
+        text = text[:4000] + "\n…(message tronqué)"
 
     if edit_from_query:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+        await update.callback_query.edit_message_text(text, reply_markup=reply_kb, disable_web_page_preview=True)
     else:
-        await update.message.reply_text(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+        await update.message.reply_text(text, reply_markup=reply_kb, disable_web_page_preview=True)
 
     return ConversationHandler.END
 
@@ -2336,6 +2583,7 @@ def build_telegram_app() -> Application:
             CommandHandler("settings", settings_cmd),
             CommandHandler("whoami", whoami_cmd),
             CallbackQueryHandler(on_menu_click, pattern="^(NEW|REFRESH|CMD_MENU|STORE_MENU)$"),
+            CallbackQueryHandler(plan_validate, pattern="^PLAN::OK$"),
         ],
         states={
             CHOOSE_STORE: [
@@ -2348,7 +2596,7 @@ def build_telegram_app() -> Application:
                 CallbackQueryHandler(choose_slot, pattern="^(SLOT::|BACK_STORES|BACK_DATES).*$")
             ],
             CHOOSE_DRIVERS: [
-                CallbackQueryHandler(choose_drivers, pattern="^(DRV::|BACK_SLOTS).*$"),
+                CallbackQueryHandler(choose_drivers, pattern="^(DRV::|BACK_SLOTS|BACK_MENU).*$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, drivers_text),
             ],
             ORDERS_MENU: [
@@ -2367,6 +2615,7 @@ def build_telegram_app() -> Application:
             SETTINGS_INPUT: [
                 CallbackQueryHandler(settings_menu_click, pattern="^SET::.*$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, settings_input_text),
+                MessageHandler(filters.Document.ALL, settings_input_document),
             ],
         },
         fallbacks=[

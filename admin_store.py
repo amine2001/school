@@ -140,6 +140,36 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_stores_active ON stores(is_active)"
         )
         _ensure_store_columns(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS driver_schedule (
+                store_id TEXT NOT NULL,
+                driver_name TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                days TEXT NOT NULL,
+                updated_at TEXT,
+                PRIMARY KEY (store_id, driver_name)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS driver_km_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id TEXT NOT NULL,
+                driver_name TEXT NOT NULL,
+                day TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                km REAL NOT NULL,
+                orders INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT,
+                UNIQUE (store_id, day, slot, driver_name)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_km_store_day ON driver_km_log(store_id, day)"
+        )
         _seed_settings(conn)
         _seed_stores(conn)
 
@@ -488,3 +518,72 @@ def stores_to_csv_rows(stores: Iterable[Dict]) -> List[Dict]:
         }
         for store in stores
     ]
+
+
+# ============================
+# Planning livreurs + historique km (équité)
+# ============================
+def replace_store_schedule(store_id: str, drivers: List[Dict]) -> None:
+    """drivers: [{"name": str, "days": [bool x 7]}] (0 = lundi). Remplace tout le planning."""
+    now = utcnow_iso()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM driver_schedule WHERE store_id = ?", (store_id,))
+        for position, driver in enumerate(drivers):
+            days = "".join("1" if worked else "0" for worked in driver["days"])
+            conn.execute(
+                "INSERT INTO driver_schedule(store_id, driver_name, position, days, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (store_id, driver["name"], position, days, now),
+            )
+
+
+def get_store_schedule(store_id: str) -> List[Dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT driver_name, days FROM driver_schedule WHERE store_id = ? ORDER BY position",
+            (store_id,),
+        ).fetchall()
+    return [
+        {"name": row["driver_name"], "days": [ch == "1" for ch in (row["days"] + "0000000")[:7]]}
+        for row in rows
+    ]
+
+
+def get_driver_km_totals(
+    store_id: str,
+    since_day: str,
+    until_day: str,
+    exclude_slot: Optional[tuple] = None,
+) -> Dict[str, float]:
+    """
+    Km cumulés par livreur entre since_day et until_day inclus (ISO YYYY-MM-DD).
+    exclude_slot=(day, slot) ignore un créneau déjà validé (recalcul du même créneau).
+    """
+    query = (
+        "SELECT driver_name, day, slot, km FROM driver_km_log "
+        "WHERE store_id = ? AND day >= ? AND day <= ?"
+    )
+    with get_connection() as conn:
+        rows = conn.execute(query, (store_id, since_day, until_day)).fetchall()
+    totals: Dict[str, float] = {}
+    for row in rows:
+        if exclude_slot and (row["day"], row["slot"]) == tuple(exclude_slot):
+            continue
+        totals[row["driver_name"]] = totals.get(row["driver_name"], 0.0) + float(row["km"])
+    return totals
+
+
+def save_slot_km(store_id: str, day: str, slot: str, entries: List[Dict]) -> None:
+    """Enregistre les km d'un créneau. Revalider le même créneau remplace l'ancien enregistrement."""
+    now = utcnow_iso()
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM driver_km_log WHERE store_id = ? AND day = ? AND slot = ?",
+            (store_id, day, slot),
+        )
+        for entry in entries:
+            conn.execute(
+                "INSERT INTO driver_km_log(store_id, driver_name, day, slot, km, orders, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (store_id, entry["name"], day, slot, float(entry["km"]), int(entry.get("orders") or 0), now),
+            )
