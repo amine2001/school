@@ -1348,17 +1348,14 @@ def apply_planning_to_plan(result: Dict, store: Dict, present: List[str], off: L
 
 
 def format_route_plan_text(result: Dict) -> str:
-    planning = result.get("planning")
     lines = [
         f"📍 Magasin: {result['store_name']}",
         f"📅 Date: {result['day_of_delivery']}",
         f"🕒 Créneau: {result['slot']}",
         f"📦 Commandes: {result['order_count']}",
         f"🚴 Livreurs: {result['num_drivers']}",
+        "",
     ]
-    if planning and planning["reserve"]:
-        lines.append("🔁 Réserve (non utilisés): " + ", ".join(planning["reserve"]))
-    lines.append("")
 
     for route in result["routes"]:
         label = route.get("driver_name") or f"Livreur {route['driver_number']}"
@@ -1385,11 +1382,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("/start received from chat_id=%s", update.effective_chat.id if update.effective_chat else None)
     await ensure_stores(context)
     if update.message:
-        extra = ""
-        if is_admin_update(update):
-            extra = "\nAdmin: utilise /settings pour modifier la configuration globale."
         await update.message.reply_text(
-            "Bringo Routes Optimizer V3🔥\nChoisis une action :" + extra,
+            "Bringo Routes Optimizer V3🔥\nChoisis une action :",
             reply_markup=main_menu_kb(),
         )
         return
@@ -2287,7 +2281,7 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     btns = [InlineKeyboardButton(str(i), callback_data=f"DRV::{i}") for i in range(1, allowed_max + 1)]
     kb = chunk_buttons(btns, per_row=5)
-    kb.append([InlineKeyboardButton("📅 Selon planning", callback_data="DRV::PLAN")])
+    kb.append([InlineKeyboardButton("Selon planning", callback_data="DRV::PLAN")])
     kb.append([InlineKeyboardButton("Saisir un nombre", callback_data="DRV::TEXT")])
     kb.append([InlineKeyboardButton("Retour créneaux", callback_data="BACK_SLOTS")])
 
